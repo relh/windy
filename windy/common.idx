@@ -1,0 +1,192 @@
+nimTitle	common	windy/common.html	module windy/common		0
+nim	WindyError	windy/common.html#WindyError	object WindyError		4
+nim	OpenGL3Dot0	windy/common.html#OpenGL3Dot0	OpenGLVersion.OpenGL3Dot0		6
+nim	OpenGL3Dot1	windy/common.html#OpenGL3Dot1	OpenGLVersion.OpenGL3Dot1		6
+nim	OpenGL3Dot2	windy/common.html#OpenGL3Dot2	OpenGLVersion.OpenGL3Dot2		6
+nim	OpenGL3Dot3	windy/common.html#OpenGL3Dot3	OpenGLVersion.OpenGL3Dot3		6
+nim	OpenGL4Dot0	windy/common.html#OpenGL4Dot0	OpenGLVersion.OpenGL4Dot0		6
+nim	OpenGL4Dot1	windy/common.html#OpenGL4Dot1	OpenGLVersion.OpenGL4Dot1		6
+nim	OpenGL4Dot2	windy/common.html#OpenGL4Dot2	OpenGLVersion.OpenGL4Dot2		6
+nim	OpenGL4Dot3	windy/common.html#OpenGL4Dot3	OpenGLVersion.OpenGL4Dot3		6
+nim	OpenGL4Dot4	windy/common.html#OpenGL4Dot4	OpenGLVersion.OpenGL4Dot4		6
+nim	OpenGL4Dot5	windy/common.html#OpenGL4Dot5	OpenGLVersion.OpenGL4Dot5		6
+nim	OpenGL4Dot6	windy/common.html#OpenGL4Dot6	OpenGLVersion.OpenGL4Dot6		6
+nim	OpenGLVersion	windy/common.html#OpenGLVersion	enum OpenGLVersion		6
+nim	Screen	windy/common.html#Screen	object Screen		19
+nim	ArrowCursor	windy/common.html#ArrowCursor	CursorKind.ArrowCursor		23
+nim	PointerCursor	windy/common.html#PointerCursor	CursorKind.PointerCursor		23
+nim	IBeamCursor	windy/common.html#IBeamCursor	CursorKind.IBeamCursor		23
+nim	CrosshairCursor	windy/common.html#CrosshairCursor	CursorKind.CrosshairCursor		23
+nim	ClosedHandCursor	windy/common.html#ClosedHandCursor	CursorKind.ClosedHandCursor		23
+nim	OpenHandCursor	windy/common.html#OpenHandCursor	CursorKind.OpenHandCursor		23
+nim	ResizeLeftCursor	windy/common.html#ResizeLeftCursor	CursorKind.ResizeLeftCursor		23
+nim	ResizeRightCursor	windy/common.html#ResizeRightCursor	CursorKind.ResizeRightCursor		23
+nim	ResizeLeftRightCursor	windy/common.html#ResizeLeftRightCursor	CursorKind.ResizeLeftRightCursor		23
+nim	ResizeUpCursor	windy/common.html#ResizeUpCursor	CursorKind.ResizeUpCursor		23
+nim	ResizeDownCursor	windy/common.html#ResizeDownCursor	CursorKind.ResizeDownCursor		23
+nim	ResizeUpDownCursor	windy/common.html#ResizeUpDownCursor	CursorKind.ResizeUpDownCursor		23
+nim	OperationNotAllowedCursor	windy/common.html#OperationNotAllowedCursor	CursorKind.OperationNotAllowedCursor		23
+nim	WaitCursor	windy/common.html#WaitCursor	CursorKind.WaitCursor		23
+nim	CustomCursor	windy/common.html#CustomCursor	CursorKind.CustomCursor		23
+nim	CursorKind	windy/common.html#CursorKind	enum CursorKind		23
+nim	Cursor	windy/common.html#Cursor	object Cursor		40
+nim	HttpHeader	windy/common.html#HttpHeader	object HttpHeader		48
+nim	HttpRequestHandle	windy/common.html#HttpRequestHandle	type HttpRequestHandle		51
+nim	WebSocketHandle	windy/common.html#WebSocketHandle	type WebSocketHandle		52
+nim	HttpResponse	windy/common.html#HttpResponse	type HttpResponse		54
+nim	Utf8Message	windy/common.html#Utf8Message	WebSocketMessageKind.Utf8Message		59
+nim	BinaryMessage	windy/common.html#BinaryMessage	WebSocketMessageKind.BinaryMessage		59
+nim	WebSocketMessageKind	windy/common.html#WebSocketMessageKind	enum WebSocketMessageKind		59
+nim	TextContent	windy/common.html#TextContent	ClipboardContentKind.TextContent		62
+nim	ImageContent	windy/common.html#ImageContent	ClipboardContentKind.ImageContent		62
+nim	ClipboardContentKind	windy/common.html#ClipboardContentKind	enum ClipboardContentKind		62
+nim	FileDialogFilter	windy/common.html#FileDialogFilter	object FileDialogFilter		65
+nim	ConfirmCancel	windy/common.html#ConfirmCancel	ConfirmKind.ConfirmCancel		72
+nim	ConfirmNo	windy/common.html#ConfirmNo	ConfirmKind.ConfirmNo		72
+nim	ConfirmYes	windy/common.html#ConfirmYes	ConfirmKind.ConfirmYes		72
+nim	ConfirmKind	windy/common.html#ConfirmKind	enum ConfirmKind		72
+nim	msaaDisabled	windy/common.html#msaaDisabled	MSAA.msaaDisabled		77
+nim	msaa2x	windy/common.html#msaa2x	MSAA.msaa2x		77
+nim	msaa4x	windy/common.html#msaa4x	MSAA.msaa4x		77
+nim	msaa8x	windy/common.html#msaa8x	MSAA.msaa8x		77
+nim	MSAA	windy/common.html#MSAA	enum MSAA		77
+nim	DecoratedResizable	windy/common.html#DecoratedResizable	WindowStyle.DecoratedResizable		80
+nim	Decorated	windy/common.html#Decorated	WindowStyle.Decorated		80
+nim	Undecorated	windy/common.html#Undecorated	WindowStyle.Undecorated		80
+nim	Transparent	windy/common.html#Transparent	WindowStyle.Transparent		80
+nim	WindowStyle	windy/common.html#WindowStyle	enum WindowStyle		80
+nim	Callback	windy/common.html#Callback	type Callback		83
+nim	ButtonCallback	windy/common.html#ButtonCallback	type ButtonCallback		84
+nim	RuneCallback	windy/common.html#RuneCallback	type RuneCallback		85
+nim	HttpErrorCallback	windy/common.html#HttpErrorCallback	type HttpErrorCallback		86
+nim	HttpResponseCallback	windy/common.html#HttpResponseCallback	type HttpResponseCallback		87
+nim	HttpProgressCallback	windy/common.html#HttpProgressCallback	type HttpProgressCallback		88
+nim	WebSocketMessageCallback	windy/common.html#WebSocketMessageCallback	type WebSocketMessageCallback		89
+nim	FileDropCallback	windy/common.html#FileDropCallback	type FileDropCallback		90
+nim	ButtonUnknown	windy/common.html#ButtonUnknown	Button.ButtonUnknown		92
+nim	MouseLeft	windy/common.html#MouseLeft	Button.MouseLeft		92
+nim	MouseRight	windy/common.html#MouseRight	Button.MouseRight		92
+nim	MouseMiddle	windy/common.html#MouseMiddle	Button.MouseMiddle		92
+nim	MouseButton4	windy/common.html#MouseButton4	Button.MouseButton4		92
+nim	MouseButton5	windy/common.html#MouseButton5	Button.MouseButton5		92
+nim	DoubleClick	windy/common.html#DoubleClick	Button.DoubleClick		92
+nim	TripleClick	windy/common.html#TripleClick	Button.TripleClick		92
+nim	QuadrupleClick	windy/common.html#QuadrupleClick	Button.QuadrupleClick		92
+nim	Key0	windy/common.html#Key0	Button.Key0		92
+nim	Key1	windy/common.html#Key1	Button.Key1		92
+nim	Key2	windy/common.html#Key2	Button.Key2		92
+nim	Key3	windy/common.html#Key3	Button.Key3		92
+nim	Key4	windy/common.html#Key4	Button.Key4		92
+nim	Key5	windy/common.html#Key5	Button.Key5		92
+nim	Key6	windy/common.html#Key6	Button.Key6		92
+nim	Key7	windy/common.html#Key7	Button.Key7		92
+nim	Key8	windy/common.html#Key8	Button.Key8		92
+nim	Key9	windy/common.html#Key9	Button.Key9		92
+nim	KeyA	windy/common.html#KeyA	Button.KeyA		92
+nim	KeyB	windy/common.html#KeyB	Button.KeyB		92
+nim	KeyC	windy/common.html#KeyC	Button.KeyC		92
+nim	KeyD	windy/common.html#KeyD	Button.KeyD		92
+nim	KeyE	windy/common.html#KeyE	Button.KeyE		92
+nim	KeyF	windy/common.html#KeyF	Button.KeyF		92
+nim	KeyG	windy/common.html#KeyG	Button.KeyG		92
+nim	KeyH	windy/common.html#KeyH	Button.KeyH		92
+nim	KeyI	windy/common.html#KeyI	Button.KeyI		92
+nim	KeyJ	windy/common.html#KeyJ	Button.KeyJ		92
+nim	KeyK	windy/common.html#KeyK	Button.KeyK		92
+nim	KeyL	windy/common.html#KeyL	Button.KeyL		92
+nim	KeyM	windy/common.html#KeyM	Button.KeyM		92
+nim	KeyN	windy/common.html#KeyN	Button.KeyN		92
+nim	KeyO	windy/common.html#KeyO	Button.KeyO		92
+nim	KeyP	windy/common.html#KeyP	Button.KeyP		92
+nim	KeyQ	windy/common.html#KeyQ	Button.KeyQ		92
+nim	KeyR	windy/common.html#KeyR	Button.KeyR		92
+nim	KeyS	windy/common.html#KeyS	Button.KeyS		92
+nim	KeyT	windy/common.html#KeyT	Button.KeyT		92
+nim	KeyU	windy/common.html#KeyU	Button.KeyU		92
+nim	KeyV	windy/common.html#KeyV	Button.KeyV		92
+nim	KeyW	windy/common.html#KeyW	Button.KeyW		92
+nim	KeyX	windy/common.html#KeyX	Button.KeyX		92
+nim	KeyY	windy/common.html#KeyY	Button.KeyY		92
+nim	KeyZ	windy/common.html#KeyZ	Button.KeyZ		92
+nim	KeyBacktick	windy/common.html#KeyBacktick	Button.KeyBacktick		92
+nim	KeyMinus	windy/common.html#KeyMinus	Button.KeyMinus		92
+nim	KeyEqual	windy/common.html#KeyEqual	Button.KeyEqual		92
+nim	KeyBackspace	windy/common.html#KeyBackspace	Button.KeyBackspace		92
+nim	KeyTab	windy/common.html#KeyTab	Button.KeyTab		92
+nim	KeyLeftBracket	windy/common.html#KeyLeftBracket	Button.KeyLeftBracket		92
+nim	KeyRightBracket	windy/common.html#KeyRightBracket	Button.KeyRightBracket		92
+nim	KeyBackslash	windy/common.html#KeyBackslash	Button.KeyBackslash		92
+nim	KeyCapsLock	windy/common.html#KeyCapsLock	Button.KeyCapsLock		92
+nim	KeySemicolon	windy/common.html#KeySemicolon	Button.KeySemicolon		92
+nim	KeyApostrophe	windy/common.html#KeyApostrophe	Button.KeyApostrophe		92
+nim	KeyEnter	windy/common.html#KeyEnter	Button.KeyEnter		92
+nim	KeyLeftShift	windy/common.html#KeyLeftShift	Button.KeyLeftShift		92
+nim	KeyComma	windy/common.html#KeyComma	Button.KeyComma		92
+nim	KeyPeriod	windy/common.html#KeyPeriod	Button.KeyPeriod		92
+nim	KeySlash	windy/common.html#KeySlash	Button.KeySlash		92
+nim	KeyRightShift	windy/common.html#KeyRightShift	Button.KeyRightShift		92
+nim	KeyLeftControl	windy/common.html#KeyLeftControl	Button.KeyLeftControl		92
+nim	KeyLeftSuper	windy/common.html#KeyLeftSuper	Button.KeyLeftSuper		92
+nim	KeyLeftAlt	windy/common.html#KeyLeftAlt	Button.KeyLeftAlt		92
+nim	KeySpace	windy/common.html#KeySpace	Button.KeySpace		92
+nim	KeyRightAlt	windy/common.html#KeyRightAlt	Button.KeyRightAlt		92
+nim	KeyRightSuper	windy/common.html#KeyRightSuper	Button.KeyRightSuper		92
+nim	KeyMenu	windy/common.html#KeyMenu	Button.KeyMenu		92
+nim	KeyRightControl	windy/common.html#KeyRightControl	Button.KeyRightControl		92
+nim	KeyDelete	windy/common.html#KeyDelete	Button.KeyDelete		92
+nim	KeyHome	windy/common.html#KeyHome	Button.KeyHome		92
+nim	KeyEnd	windy/common.html#KeyEnd	Button.KeyEnd		92
+nim	KeyInsert	windy/common.html#KeyInsert	Button.KeyInsert		92
+nim	KeyPageUp	windy/common.html#KeyPageUp	Button.KeyPageUp		92
+nim	KeyPageDown	windy/common.html#KeyPageDown	Button.KeyPageDown		92
+nim	KeyEscape	windy/common.html#KeyEscape	Button.KeyEscape		92
+nim	KeyUp	windy/common.html#KeyUp	Button.KeyUp		92
+nim	KeyDown	windy/common.html#KeyDown	Button.KeyDown		92
+nim	KeyLeft	windy/common.html#KeyLeft	Button.KeyLeft		92
+nim	KeyRight	windy/common.html#KeyRight	Button.KeyRight		92
+nim	KeyPrintScreen	windy/common.html#KeyPrintScreen	Button.KeyPrintScreen		92
+nim	KeyScrollLock	windy/common.html#KeyScrollLock	Button.KeyScrollLock		92
+nim	KeyPause	windy/common.html#KeyPause	Button.KeyPause		92
+nim	KeyF1	windy/common.html#KeyF1	Button.KeyF1		92
+nim	KeyF2	windy/common.html#KeyF2	Button.KeyF2		92
+nim	KeyF3	windy/common.html#KeyF3	Button.KeyF3		92
+nim	KeyF4	windy/common.html#KeyF4	Button.KeyF4		92
+nim	KeyF5	windy/common.html#KeyF5	Button.KeyF5		92
+nim	KeyF6	windy/common.html#KeyF6	Button.KeyF6		92
+nim	KeyF7	windy/common.html#KeyF7	Button.KeyF7		92
+nim	KeyF8	windy/common.html#KeyF8	Button.KeyF8		92
+nim	KeyF9	windy/common.html#KeyF9	Button.KeyF9		92
+nim	KeyF10	windy/common.html#KeyF10	Button.KeyF10		92
+nim	KeyF11	windy/common.html#KeyF11	Button.KeyF11		92
+nim	KeyF12	windy/common.html#KeyF12	Button.KeyF12		92
+nim	KeyNumLock	windy/common.html#KeyNumLock	Button.KeyNumLock		92
+nim	Numpad0	windy/common.html#Numpad0	Button.Numpad0		92
+nim	Numpad1	windy/common.html#Numpad1	Button.Numpad1		92
+nim	Numpad2	windy/common.html#Numpad2	Button.Numpad2		92
+nim	Numpad3	windy/common.html#Numpad3	Button.Numpad3		92
+nim	Numpad4	windy/common.html#Numpad4	Button.Numpad4		92
+nim	Numpad5	windy/common.html#Numpad5	Button.Numpad5		92
+nim	Numpad6	windy/common.html#Numpad6	Button.Numpad6		92
+nim	Numpad7	windy/common.html#Numpad7	Button.Numpad7		92
+nim	Numpad8	windy/common.html#Numpad8	Button.Numpad8		92
+nim	Numpad9	windy/common.html#Numpad9	Button.Numpad9		92
+nim	NumpadDecimal	windy/common.html#NumpadDecimal	Button.NumpadDecimal		92
+nim	NumpadEnter	windy/common.html#NumpadEnter	Button.NumpadEnter		92
+nim	NumpadAdd	windy/common.html#NumpadAdd	Button.NumpadAdd		92
+nim	NumpadSubtract	windy/common.html#NumpadSubtract	Button.NumpadSubtract		92
+nim	NumpadMultiply	windy/common.html#NumpadMultiply	Button.NumpadMultiply		92
+nim	NumpadDivide	windy/common.html#NumpadDivide	Button.NumpadDivide		92
+nim	NumpadEqual	windy/common.html#NumpadEqual	Button.NumpadEqual		92
+nim	Button	windy/common.html#Button	enum Button		92
+nim	ButtonView	windy/common.html#ButtonView	type ButtonView		208
+nim	defaultHttpDeadline	windy/common.html#defaultHttpDeadline	const defaultHttpDeadline		211
+nim	`==`	windy/common.html#==,HttpRequestHandle,HttpRequestHandle	proc `==`(a, b: HttpRequestHandle): bool		213
+nim	`==`	windy/common.html#==,WebSocketHandle,WebSocketHandle	proc `==`(a, b: WebSocketHandle): bool		216
+nim	`[]`	windy/common.html#[],ButtonView,Button	proc `[]`(buttonView: ButtonView; button: Button): bool		219
+nim	len	windy/common.html#len,ButtonView	proc len(buttonView: ButtonView): int		222
+nim	`[]`	windy/common.html#[],seq[HttpHeader],string	proc `[]`(headers: seq[HttpHeader]; key: string): string		225
+nim	`[]=`	windy/common.html#[]=,seq[HttpHeader],string,string	proc `[]=`(headers: var seq[HttpHeader]; key, value: string)		232
+nim	size	windy/common.html#size,Screen	proc size(screen: Screen): IVec2		241
+nim	warn	windy/common.html#warn,string	proc warn(message: string)		248
+nimgrp	==	windy/common.html#==-procs-all	proc		213
+nimgrp	[]	windy/common.html#[]-procs-all	proc		219
