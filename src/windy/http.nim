@@ -63,15 +63,21 @@ proc newWebSocketHandle(): WebSocketHandle =
       webSockets[result] = state
       break
 
+proc closeClient(state: HttpRequestState) {.raises: [].} =
+  if state.client == nil:
+    return
+  try:
+    state.client.close()
+  except:
+    discard
+  state.client = nil
+
 proc cancel*(handle: HttpRequestHandle) {.raises: [].} =
   let state = httpRequests.getOrDefault(handle, nil)
   if state == nil:
     return
   state.canceled = true
-  try:
-    state.client.close()
-  except:
-    discard
+  state.closeClient()
 
 proc close*(handle: WebSocketHandle) {.raises: [].} =
   let state = webSockets.getOrDefault(handle, nil)
@@ -88,7 +94,10 @@ proc httpRequestTasklet(handle: HttpRequestHandle) {.async.} =
   await sleepAsync(0) # Sleep until next poll
 
   let state = httpRequests.getOrDefault(handle, nil)
+  if state == nil:
+    return
   if state.canceled:
+    httpRequests.del(handle)
     return
 
   state.client = newAsyncHttpClient()
@@ -100,7 +109,6 @@ proc httpRequestTasklet(handle: HttpRequestHandle) {.async.} =
         state.onDownloadProgress(progress.int, total.int)
       except:
         handle.cancel()
-        httpRequests.del(handle)
         if state.onError != nil:
           state.onError(getCurrentExceptionMsg())
 
@@ -146,19 +154,21 @@ proc httpRequestTasklet(handle: HttpRequestHandle) {.async.} =
         state.onDownloadProgress(httpResponse.body.len, httpResponse.body.len)
       if not state.canceled and state.onResponse != nil:
         state.onResponse(httpResponse)
-
-    # Handle is always removed after all callbacks (but before onError)
-    httpRequests.del(handle)
   except:
-    httpRequests.del(handle)
     if not state.canceled and state.onError != nil:
       state.onError(getCurrentExceptionMsg())
+  finally:
+    state.closeClient()
+    httpRequests.del(handle)
 
 proc webSocketTasklet(handle: WebSocketHandle) {.async.} =
   await sleepAsync(0) # Sleep until next poll
 
   let state = webSockets.getOrDefault(handle, nil)
+  if state == nil:
+    return
   if state.closed:
+    webSockets.del(handle)
     return
 
   var onOpenCalled: bool
@@ -249,14 +259,15 @@ proc pollHttp*() =
   let now = epochTime()
 
   for handle, state in httpRequests:
-    if state.deadline > 0 and state.deadline <= now:
+    if not state.canceled and state.deadline > 0 and state.deadline <= now:
       let msg = "Deadline of " & $state.deadline & " exceeded, time is " & $now
       handle.cancel()
       if state.onError != nil:
         state.onError(msg)
 
   for handle, state in webSockets:
-    if state.deadline > 0 and state.deadline <= now and state.webSocket == nil:
+    if not state.closed and state.deadline > 0 and
+        state.deadline <= now and state.webSocket == nil:
       let msg = "Deadline of " & $state.deadline & " exceeded, time is " & $now
       handle.close()
       if state.onError != nil:

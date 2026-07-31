@@ -31,6 +31,7 @@ type
 
   # use HttpRequestHandle from common.nim
   EmsHttpRequestState = ref object
+    handle: HttpRequestHandle
     url, verb: string
     headers: seq[HttpHeader]
     requestBody: string
@@ -116,14 +117,21 @@ proc abortFetch(state: EmsHttpRequestState) =
 proc pollHttp() =
   ## Poll HTTP requests.
   let now = epochTime()
-  # Deadline checks
+  var expiredRequests: seq[HttpRequestHandle]
   for handle, state in httpRequests:
-    if state.completed: continue
-    if state.deadline > 0 and state.deadline <= now:
-      state.completed = true
-      state.abortFetch()
+    if not state.completed and state.deadline > 0 and state.deadline <= now:
+      expiredRequests.add(handle)
+  for handle in expiredRequests:
+    let state = httpRequests.getOrDefault(handle, nil)
+    if state == nil or state.completed:
+      continue
+    state.completed = true
+    state.abortFetch()
+    try:
       if state.onError != nil:
         state.onError("Deadline exceeded")
+    finally:
+      httpRequests.del(handle)
   var expiredSockets: seq[WebSocketHandle]
   for handle, state in webSockets:
     if not state.closed and state.deadline > 0 and state.deadline <= now:
@@ -756,6 +764,9 @@ proc onFetchSuccess(fetch: ptr emscripten_fetch_t) {.cdecl.} =
     return
   state.completed = true
   state.fetch = nil
+  defer:
+    emscripten_fetch_close(fetch)
+    httpRequests.del(state.handle)
   var response = HttpResponse()
   response.code = int(fetch.status)
   if fetch.numBytes > 0 and fetch.data != nil:
@@ -765,7 +776,6 @@ proc onFetchSuccess(fetch: ptr emscripten_fetch_t) {.cdecl.} =
   # Headers: responseHeaders is a raw header block; keep as empty for now
   if state.onResponse != nil:
     state.onResponse(response)
-  emscripten_fetch_close(fetch)
 
 proc onFetchError(fetch: ptr emscripten_fetch_t) {.cdecl.} =
   let state = getState(fetch)
@@ -773,13 +783,15 @@ proc onFetchError(fetch: ptr emscripten_fetch_t) {.cdecl.} =
     return
   state.completed = true
   state.fetch = nil
+  defer:
+    emscripten_fetch_close(fetch)
+    httpRequests.del(state.handle)
   if state.onError != nil:
     var msg = $fetch.status & " "
     for c in fetch.statusText:
       if c == '\0': break
       msg &= $c
     state.onError(msg)
-  emscripten_fetch_close(fetch)
 
 proc onFetchProgress(fetch: ptr emscripten_fetch_t) {.cdecl.} =
   let state = getState(fetch)
@@ -811,6 +823,7 @@ proc startHttpRequest*(
       break
 
   state.url = url
+  state.handle = handle
   state.verb = verb
   state.headers = headers
   state.requestBody = body
@@ -850,6 +863,7 @@ proc cancel*(handle: HttpRequestHandle) {.raises: [].} =
   if state == nil or state.completed: return
   state.completed = true
   state.abortFetch()
+  httpRequests.del(handle)
 
 proc deadline*(handle: HttpRequestHandle): float64 =
   ## Get the deadline of an HTTP request.
