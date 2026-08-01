@@ -72,12 +72,23 @@ proc closeClient(state: HttpRequestState) {.raises: [].} =
     discard
   state.client = nil
 
+proc closeCanceledClient(state: HttpRequestState) {.raises: [].} =
+  ## Nim's async TLS receive callbacks retain the socket BIO across an await.
+  ## Closing here frees that BIO before an already-ready callback can run.
+  ## The request tasklet suppresses canceled callbacks and closes in `finally`,
+  ## after its pending TLS operation has settled.
+  if state.client != nil:
+    let socket = state.client.getSocket()
+    if socket != nil and socket.isSsl:
+      return
+  state.closeClient()
+
 proc cancel*(handle: HttpRequestHandle) {.raises: [].} =
   let state = httpRequests.getOrDefault(handle, nil)
   if state == nil:
     return
   state.canceled = true
-  state.closeClient()
+  state.closeCanceledClient()
 
 proc close*(handle: WebSocketHandle) {.raises: [].} =
   let state = webSockets.getOrDefault(handle, nil)
