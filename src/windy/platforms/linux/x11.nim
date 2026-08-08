@@ -47,6 +47,7 @@ type
     innerDecorated: bool
     innerFocused: bool
     mouseCaptured: bool
+    vsyncEnabled: bool
 
     # XDnD state
     xdndSource: XWindow
@@ -405,6 +406,30 @@ proc makeContextCurrent*(window: Window) =
 
 proc swapBuffers*(window: Window) =
   display.glXSwapBuffers(window.handle)
+
+proc applyVsync(window: Window, enabled: bool) =
+  if glXSwapIntervalEXT != nil:
+    display.glXSwapIntervalEXT(window.handle, if enabled: 1 else: 0)
+  elif glXSwapIntervalMESA != nil:
+    glXSwapIntervalMESA(if enabled: 1 else: 0)
+  elif glXSwapIntervalSGI != nil:
+    if not enabled:
+      raise WindyError.newException(
+        "Disabling VSync is not supported by GLX_SGI_swap_control"
+      )
+    glXSwapIntervalSGI(1)
+  else:
+    raise WindyError.newException("VSync control is not supported")
+  window.vsyncEnabled = enabled
+
+proc vsync*(window: Window): bool =
+  ## Returns true when vertical sync is enabled for this window.
+  window.vsyncEnabled
+
+proc `vsync=`*(window: Window, enabled: bool) =
+  ## Changes the GLX swap interval without recreating the window.
+  if window.vsyncEnabled != enabled:
+    window.applyVsync(enabled)
 
 template blockUntil(expression: untyped) {.dirty.} =
   ## In X11 many properties are async, you change them and then it takes
@@ -819,15 +844,7 @@ proc newWindow*(
 
   makeContextCurrent result
 
-  if vsync:
-    if glXSwapIntervalEXT != nil:
-      display.glXSwapIntervalEXT(result.handle, 1)
-    elif glXSwapIntervalMESA != nil:
-      glXSwapIntervalMESA(1)
-    elif glXSwapIntervalSGI != nil:
-      glXSwapIntervalSGI(1)
-    else:
-      raise WindyError.newException("VSync is not supported")
+  result.applyVsync(vsync)
 
   if visible:
     result.visible = true
