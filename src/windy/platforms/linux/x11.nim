@@ -408,16 +408,20 @@ proc swapBuffers*(window: Window) =
   display.glXSwapBuffers(window.handle)
 
 proc applyVsync(window: Window, enabled: bool) =
+  window.makeContextCurrent()
+  let interval = if enabled: 1.cint else: 0.cint
   if glXSwapIntervalEXT != nil:
-    display.glXSwapIntervalEXT(window.handle, if enabled: 1 else: 0)
+    display.glXSwapIntervalEXT(window.handle, interval)
   elif glXSwapIntervalMESA != nil:
-    glXSwapIntervalMESA(if enabled: 1 else: 0)
+    if glXSwapIntervalMESA(interval) != 0:
+      raise WindyError.newException("Error setting the GLX swap interval")
   elif glXSwapIntervalSGI != nil:
     if not enabled:
       raise WindyError.newException(
         "Disabling VSync is not supported by GLX_SGI_swap_control"
       )
-    glXSwapIntervalSGI(1)
+    if glXSwapIntervalSGI(interval) != 0:
+      raise WindyError.newException("Error setting the GLX swap interval")
   else:
     raise WindyError.newException("VSync control is not supported")
   window.vsyncEnabled = enabled

@@ -1370,7 +1370,9 @@ proc vsync*(window: Window): bool =
 
 proc `vsync=`*(window: Window, enabled: bool) =
   ## Changes the OpenGL swap interval without recreating the window.
-  when Backend == OpenGLBackend:
+  if window.vsyncEnabled == enabled:
+    return
+  when not defined(useDirectX) and not defined(useVulkan) and not defined(useCpu):
     window.makeContextCurrent()
     if wglSwapIntervalEXT(if enabled: 1 else: 0) == 0:
       raise newException(WindyError, "Error setting swap interval")

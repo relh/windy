@@ -1181,7 +1181,10 @@ proc vsync*(window: Window): bool =
 
 proc `vsync=`*(window: Window, enabled: bool) =
   ## Changes the OpenGL swap interval without recreating the window.
+  if window.vsyncEnabled == enabled:
+    return
   when not defined(useMetal4) and not defined(useCpu):
+    window.makeContextCurrent()
     var swapInterval: GLint = if enabled: 1 else: 0
     window.inner.contentView.NSOpenGLView.openGLContext.setValues(
       swapInterval.addr,
