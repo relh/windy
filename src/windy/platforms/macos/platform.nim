@@ -737,13 +737,13 @@ proc otherMouseDown(self: ID, cmd: SEL, event: NSEvent): ID {.cdecl.} =
 
   case event.buttonNumber:
   of 2:
-  window.updateMousePosition(event)
+    window.updateMousePosition(event)
     window.handleButtonPress(MouseMiddle)
   of 3:
-  window.updateMousePosition(event)
+    window.updateMousePosition(event)
     window.handleButtonPress(MouseButton4)
   of 4:
-  window.updateMousePosition(event)
+    window.updateMousePosition(event)
     window.handleButtonPress(MouseButton5)
   else:
     discard
@@ -755,13 +755,13 @@ proc otherMouseUp(self: ID, cmd: SEL, event: NSEvent): ID {.cdecl.} =
 
   case event.buttonNumber:
   of 2:
-  window.updateMousePosition(event)
+    window.updateMousePosition(event)
     window.handleButtonRelease(MouseMiddle)
   of 3:
-  window.updateMousePosition(event)
+    window.updateMousePosition(event)
     window.handleButtonRelease(MouseButton4)
   of 4:
-  window.updateMousePosition(event)
+    window.updateMousePosition(event)
     window.handleButtonRelease(MouseButton5)
   else:
     discard
