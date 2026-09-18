@@ -8,7 +8,7 @@ import ../../http
 export http
 
 proc XkbSetDetectableAutoRepeat(display: Display, detectable: cint,
-    supported: ptr cint): cint {.cdecl, importc, dynlib: "libX11.so.6".}
+    supported: ptr cint): cint {.cdecl, importc, dynlib: libX11.}
 
 type
   XWindow = x.Window
