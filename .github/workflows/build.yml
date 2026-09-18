@@ -25,6 +25,14 @@ jobs:
 
     # Run tests.
     - run: nim c tests/test.nim
+    - run: nim c tests/manual_inputs.nim
+    - run: nim r tests/test_openurl.nim
+    - run: nim r tests/test_macos.nim
+      if: matrix.os == 'macos-latest'
+    - run: nim r tests/test_tempfiles.nim
+      if: matrix.os == 'macos-latest'
+    - run: nim r -d:useCpu tests/test_macos.nim
+      if: matrix.os == 'macos-latest'
     - run: nim r -d:useCpu tests/test_cpu_pixels.nim
       if: matrix.os == 'windows-latest'
 
@@ -42,6 +50,7 @@ jobs:
     - run: nim c examples/fixedsize.nim
     - run: nim c examples/fullscreen.nim
     - run: nim c examples/icon.nim
+    - run: nim c examples/mouse_inside.nim
     - run: nim c examples/opengl_version.nim
     - run: nim c examples/openurl.nim
     - run: nim c examples/property_changes.nim
@@ -56,6 +65,8 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
 
     # Build Emscripten examples on Ubuntu only.
+    - run: nim c -d:emscripten tests/manual_inputs.nim
+      if: matrix.os == 'ubuntu-latest'
     - run: nim c -d:emscripten examples/basic.nim
       if: matrix.os == 'ubuntu-latest'
     - run: nim c -d:emscripten examples/basic_boxy.nim
@@ -81,6 +92,8 @@ jobs:
     - run: nim c -d:emscripten examples/fullscreen.nim
       if: matrix.os == 'ubuntu-latest'
     - run: nim c -d:emscripten examples/icon.nim
+      if: matrix.os == 'ubuntu-latest'
+    - run: nim c -d:emscripten examples/mouse_inside.nim
       if: matrix.os == 'ubuntu-latest'
     - run: nim c -d:emscripten examples/opengl_version.nim
       if: matrix.os == 'ubuntu-latest'
