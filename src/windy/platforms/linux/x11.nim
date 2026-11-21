@@ -192,10 +192,14 @@ proc property(
 
   result.kind = kind
 
-  let len = length.int * format.int div 8
+  # XGetWindowProperty returns format-32 items in native long slots.
+  let itemBytes = if format == 32: sizeof(clong) else: format.int div 8
+  let len = length.int * itemBytes
   result.data = newString(len)
   if len != 0:
     copyMem(result.data[0].addr, data, len)
+  if data != nil:
+    XFree(data)
 
 proc setProperty(
   window: XWindow, property: Atom, kind: Atom, format: cint, data: string
@@ -507,7 +511,7 @@ proc `maximized=`*(window: Window, v: bool) =
   blockUntil(window.maximized == v)
 
 proc minimized*(window: Window): bool =
-  let wState = window.handle.property(xaWMState).data.asSeq(int32)
+  let wState = window.handle.property(xaWMState).data.asSeq(clong)
   return wState.len >= 1 and wState[0] == 3 or
     xaNetWMStateHiden in window.handle.wmState
 
