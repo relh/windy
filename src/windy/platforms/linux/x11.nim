@@ -1,18 +1,35 @@
 import
-  std/[os, osproc, sequtils, sets, strformat, strutils, times, unicode, uri, pathnorm],
+  std/[math, monotimes, os, osproc, sequtils, sets, strformat, strutils,
+    times, unicode, uri, pathnorm],
   ../../[common, internal],
-  vmath, pixie,
-  x11/[glx, keysym, x, xevent, xlib, xcursor]
+  opengl, vmath, pixie,
+  x11/[glx, keysym, x, xevent, xlib, xcursor],
+  ./native/[pixels, waits], ./tray, ./notifications
 
 import ../../http
 export http
+export tray except pollTrayEvents, trayWaitTimeout
+export notifications except pollNotificationEvents, notificationWaitTimeout
+
+import ./backends
+when HasDirect:
+  import ./native/state
+
+const
+  MaxClipboardBytes = 32 * 1024 * 1024
+  MaxClipboardPixels = 32 * 1024 * 1024
+  ClipboardTimeoutMs = 1000
+  ClipboardChunkBytes = 64 * 1024
 
 type
   XWindow = x.Window
 
   Window* = ref object
+    when HasDirect:
+      direct*: DirectWindowState
     onCloseRequest*: Callback
     onFrame*: Callback
+    onTouch*: TouchCallback
     onMove*: Callback
     onResize*: Callback
     onFocusChange*: Callback
@@ -21,8 +38,11 @@ type
     onButtonPress*: ButtonCallback
     onButtonRelease*: ButtonCallback
     onRune*: RuneCallback
+    onTextInput*: TextInputCallback
+    onTextEdit*: TextInputEditCallback
     onImeChange*: Callback
     onFileDrop*: FileDropCallback
+    onFileDropPaths*: FileDropPathsCallback
 
     mousePos, mousePrevPos: IVec2
     buttonClicking, buttonToggle: set[Button]
@@ -36,17 +56,25 @@ type
     prevSize, prevPos: IVec2
 
     handle: XWindow
+    colormap: Colormap
     ctx: GlxContext
+    gpuPixelOptIn: bool
+    gpuPixelVsyncState: bool
     gc: GC
     ic: XIC
     im: XIM
     xSyncCounter: XSyncCounter
     lastSync: XSyncValue
+    syncState: SyncState
+    syncDeadline: float64
 
     closeRequested, closed: bool
     innerDecorated: bool
     innerFocused: bool
     mouseCaptured: bool
+    capturePos, restorePos, warpPos: IVec2
+    warpSerial, mouseSerial: culong
+    warpPending: bool
 
     # XDnD state
     xdndSource: XWindow
@@ -61,6 +89,16 @@ type
     kwm
     other
 
+  SyncState = enum
+    ## Where a window is in the _NET_WM_SYNC_REQUEST handshake.
+    SyncIdle ## No request outstanding.
+    SyncRequested ## Request received, waiting for its ConfigureNotify.
+    SyncConfigured ## ConfigureNotify handled, acknowledge after the next frame.
+
+const
+  syncConfigureTimeout = 0.010
+    ## Seconds to wait for the ConfigureNotify that follows a sync request.
+
 var
   quitRequested*: bool
   onQuitRequest*: Callback
@@ -68,6 +106,7 @@ var
   multiClickRadius*: float = 4
 
   initialized: bool
+  contextError: bool
   windows: seq[Window]
 
   display: Display
@@ -75,6 +114,15 @@ var
   wmForDecoratedKind: WmForDecoratedKind
   clipboardWindow: XWindow
   clipboardContent: string
+  clipboardImage: string
+  clipboardReadData: string
+  clipboardReadTarget: Atom
+  clipboardReadPending: bool
+  clipboardReadIncremental: bool
+  clipboardReadFailed: bool
+  clipboardReadError: string
+  xaImagePng: Atom
+  xaIncremental: Atom
   xaCardinal: Atom
   xaWindyXdndTargetProperty: Atom
 
@@ -114,6 +162,8 @@ proc initConstants(display: Display) =
   xaWindyClipboardTargetProperty = display.XInternAtom("windy_clipboardTargetProperty", 0)
   xaWindyXdndTargetProperty = display.XInternAtom("windy_xdndTargetProperty", 0)
   xaTargets = display.XInternAtom("TARGETS", 0)
+  xaImagePng = display.XInternAtom("image/png", 0)
+  xaIncremental = display.XInternAtom("INCR", 0)
   xaText = display.XInternAtom("TEXT", 0)
   xaCardinal = display.XInternAtom("CARDINAL", 0)
 
@@ -138,7 +188,8 @@ proc initConstants(display: Display) =
 proc atomIfExist(name: string): Atom =
   display.XInternAtom(name, 1)
 
-proc handleXError(d: Display, event: ptr XErrorEvent): bool {.cdecl.} =
+proc handleXError(d: Display, event: ptr XErrorEvent): cint {.cdecl.} =
+  ## Reports X11 errors through Windy's exception type.
   raise WindyError.newException("Error dealing with X11: " &
       $event.errorCode.Status)
 
@@ -153,6 +204,7 @@ proc init =
     raise WindyError.newException("Error opening X11 display, make sure the DISPLAY environment variable is set correctly")
 
   display.initConstants()
+  initEventWait()
 
   wmForDecoratedKind =
     if (decoratedAtom = atomIfExist"_MOTIF_WM_HINTS"; decoratedAtom != 0):
@@ -385,7 +437,44 @@ proc queryKeyboardState(): set[0..255] =
   display.XQueryKeymap(r)
   return cast[ptr set[0..255]](r.addr)[]
 
+proc warpMouse(window: Window, pos: IVec2) =
+  ## Tracks warps so their motion events do not become user input.
+  window.warpPos = pos
+  window.warpSerial = display.XNextRequest()
+  window.warpPending = true
+  display.XWarpPointer(
+    0,
+    window.handle,
+    0,
+    0,
+    0,
+    0,
+    pos.x,
+    pos.y
+  )
+  display.XFlush()
+
+proc releaseMouse*(window: Window) =
+  ## Shows the cursor and restores normal absolute mouse tracking.
+  if not window.mouseCaptured:
+    return
+  window.mouseCaptured = false
+  display.XUngrabPointer(CurrentTime)
+  window.warpMouse(window.restorePos)
+  window.mouseSerial = window.warpSerial
+  window.mousePos = window.restorePos
+  window.mousePrevPos = window.restorePos
+
 proc destroy(window: Window) =
+  ## Releases native resources and any active pointer grab.
+  if window.closed:
+    return
+  window.releaseMouse()
+  if window.ctx != nil:
+    if glXGetCurrentContext() == window.ctx:
+      display.glXMakeCurrent(0.Drawable, nil)
+    display.glXDestroyContext(window.ctx)
+    window.ctx = nil
   if window.ic != nil:
     XDestroyIC(window.ic)
   if window.im != nil:
@@ -394,6 +483,8 @@ proc destroy(window: Window) =
     display.XFreeGC(window.gc)
   if window.handle != 0:
     display.XDestroyWindow(window.handle)
+  if window.colormap != 0:
+    display.XFreeColormap(window.colormap)
   if window.xSyncCounter.int != 0:
     display.XSyncDestroyCounter(window.xSyncCounter)
   wasMoved window[]
@@ -402,7 +493,19 @@ proc destroy(window: Window) =
 proc closed*(window: Window): bool = window.closed
 
 proc close*(window: Window) =
+  window.onTextInput = nil
+  window.onTextEdit = nil
+  window.onFileDropPaths = nil
+  window.onFileDrop = nil
   destroy window
+
+proc hasGpuPixelContext*(window: Window): bool =
+  ## True when GPU pixels were opted in, a GLX context is present, and the window is open.
+  window != nil and window.gpuPixelOptIn and window.ctx != nil and not window.closed
+
+proc gpuPixelVsync*(window: Window): bool =
+  ## True only if opt-in GPU vsync was successfully configured.
+  window != nil and not window.closed and window.gpuPixelVsyncState
 
 proc makeContextCurrent*(window: Window) =
   display.glXMakeCurrent(window.handle, window.ctx)
@@ -435,6 +538,7 @@ proc `visible=`*(window: Window, v: bool) =
   if v:
     display.XMapWindow(window.handle)
   else:
+    window.releaseMouse()
     display.XUnmapWindow(window.handle)
   blockUntil(window.visible == v)
 
@@ -729,6 +833,111 @@ proc `cursor=`*(window: Window, v: common.Cursor) =
   window.state.cursor = v
   window.applyCursor()
 
+proc hasGlxExtension(name: string): bool =
+  ## True when the GLX server advertises this exact extension name.
+  let raw = display.glXQueryExtensionsString(display.defaultScreen)
+  if raw == nil:
+    return false
+  for part in split($raw):
+    if part == name:
+      return true
+
+proc createContext(
+  style: WindowStyle,
+  openglVersion: OpenGLVersion,
+  msaa: MSAA,
+  depthBits, stencilBits: int
+): tuple[visual: XVisualInfo, context: GlxContext] =
+  ## Chooses a matching visual and creates the requested OpenGL context.
+  let
+    extensions = strutils.splitWhitespace(
+      $display.glXQueryExtensionsString(display.defaultScreen)
+    )
+    create = cast[GlxCreateContextAttribsProc](
+      glXGetProcAddressARB("glXCreateContextAttribsARB")
+    )
+  if "GLX_ARB_create_context" notin extensions or create == nil:
+    raise WindyError.newException("GLX_ARB_create_context is not supported")
+  if openglVersion >= OpenGL3Dot2 and
+    "GLX_ARB_create_context_profile" notin extensions:
+      raise WindyError.newException("OpenGL core profiles are not supported")
+
+  var
+    attributes = [
+      GlxXRenderable, 1,
+      GlxDrawableType, GlxWindowBit,
+      GlxRenderType, GlxRgbaBit,
+      GlxXVisualType, GlxTrueColor,
+      GlxDoublebuffer, 1,
+      GlxRedSize, 8,
+      GlxGreenSize, 8,
+      GlxBlueSize, 8,
+      GlxAlphaSize, 8,
+      GlxDepthSize, depthBits.cint,
+      GlxStencilSize, stencilBits.cint,
+      GlxSampleBuffers, cint(msaa != msaaDisabled),
+      GlxSamples, msaa.cint,
+      0
+    ]
+    count: cint
+  let configs = display.glXChooseFBConfig(
+    display.defaultScreen,
+    attributes[0].addr,
+    count.addr
+  )
+  if configs == nil:
+    raise WindyError.newException("No matching OpenGL framebuffer configuration")
+  defer:
+    XFree(configs)
+
+  var config: GlxFbConfig
+  for i in 0 ..< count:
+    let visual = display.glXGetVisualFromFBConfig(configs[i])
+    if visual == nil:
+      continue
+    let suitable = style != Transparent or visual.depth == 32
+    if suitable:
+      result.visual = visual[]
+      config = configs[i]
+    XFree(visual)
+    if suitable:
+      break
+  if config == nil:
+    raise WindyError.newException("No matching OpenGL window visual")
+
+  var contextAttributes = @[
+    GlxContextMajorVersion, openglVersion.major.cint,
+    GlxContextMinorVersion, openglVersion.minor.cint
+  ]
+  if openglVersion >= OpenGL3Dot2:
+    contextAttributes.add [GlxContextProfileMask, GlxContextCoreProfileBit]
+  contextAttributes.add 0
+
+  proc handleContextError(d: Display, event: ptr XErrorEvent): cint {.cdecl.} =
+    ## Records context creation errors without unwinding through Xlib.
+    contextError = true
+
+  display.XSync()
+  let previousHandler = XSetErrorHandler(handleContextError)
+  defer:
+    XSetErrorHandler(previousHandler)
+  contextError = false
+  result.context = create(
+    display,
+    config,
+    nil,
+    1,
+    contextAttributes[0].addr
+  )
+  display.XSync()
+  if contextError or result.context == nil:
+    if result.context != nil:
+      display.glXDestroyContext(result.context)
+    raise WindyError.newException(
+      "Unable to create OpenGL " & $openglVersion.major & "." &
+      $openglVersion.minor & " context"
+    )
+
 proc newWindow*(
   title: string,
   size: IVec2,
@@ -738,120 +947,177 @@ proc newWindow*(
   openglVersion = OpenGL4Dot1,
   msaa = msaaDisabled,
   depthBits = 24,
-  stencilBits = 8
+  stencilBits = 8,
+  linuxOptions = LinuxWindowOptions()
 ): Window =
-  ## Creates a new window. Intitializes Windy if needed.
+  ## Creates a new window and initializes Windy if needed.
   init()
   result = Window()
   result.innerDecorated = true
   result.state.runeInputEnabled = true
+  result.gpuPixelOptIn = linuxOptions.gpuPixels
+  try:
+    let root = display.defaultRootWindow
 
-  let root = display.defaultRootWindow
-
-  var vi: XVisualInfo
-  if style == Transparent:
-    display.XMatchVisualInfo(display.defaultScreen, 32, TrueColor, vi.addr)
-  else:
-    display.XMatchVisualInfo(display.defaultScreen, 24, TrueColor, vi.addr)
-    # strangely, glx returns nil when -d:danger
-    # var attribList = [GlxRgba, GlxDepthSize, 24, GlxDoublebuffer]
-    # vi = display.glXChooseVisual(display.defaultScreen, attribList[0].addr)[]
-
-  let cmap = display.XCreateColormap(root, vi.visual, AllocNone)
-  var swa = XSetWindowAttributes(colormap: cmap)
-
-  result.handle = display.XCreateWindow(
-    root,
-    0, 0,
-    size.x.cuint, size.y.cuint,
-    0,
-    vi.depth.cuint,
-    InputOutput,
-    vi.visual,
-    CwColormap or CwEventMask or CwBorderPixel,
-    swa.addr
-  )
-
-  display.XSelectInput(
-    result.handle,
-    ExposureMask or
-    KeyPressMask or
-    KeyReleaseMask or
-    PointerMotionMask or
-    ButtonPressMask or
-    ButtonReleaseMask or
-    StructureNotifyMask or
-    EnterWindowMask or
-    LeaveWindowMask or
-    FocusChangeMask or
-    PropertyChangeMask
-  )
-
-  var wmProtocols = [xaWMDeleteWindow, xaNetWMSyncRequest]
-  display.XSetWMProtocols(
-    result.handle, wmProtocols[0].addr, cint wmProtocols.len
-  )
-
-  result.im = display.XOpenIM
-  result.ic = result.im.XCreateIC(
-    "clientWindow",
-    result.handle,
-    "focusWindow",
-    result.handle,
-    "inputStyle",
-    XimPreeditNothing or XimStatusNothing,
-    nil
-  )
-
-  var gcv: XGCValues
-  result.gc = display.XCreateGC(result.handle, GCForeground or GCBackground, gcv.addr)
-
-  result.ctx = display.glXCreateContext(vi.addr, nil, 1)
-
-  if result.ctx == nil:
-    raise WindyError.newException("Error creating OpenGL context")
-
-  result.title = title
-
-  # Set a default cursor
-  result.state.cursor = common.Cursor(kind: ArrowCursor)
-  result.applyCursor()
-
-  # Enable XDnD awareness (version 5)
-  const xdndVersion = 5'u32
-  result.handle.setProperty(xaXdndAware, xaCardinal, 32, @[xdndVersion].asString)
-
-  makeContextCurrent result
-
-  if vsync:
-    if glXSwapIntervalEXT != nil:
-      display.glXSwapIntervalEXT(result.handle, 1)
-    elif glXSwapIntervalMESA != nil:
-      glXSwapIntervalMESA(1)
-    elif glXSwapIntervalSGI != nil:
-      glXSwapIntervalSGI(1)
+    var vi: XVisualInfo
+    if linuxOptions.gpuPixels:
+      let vis =
+        if style == Transparent:
+          var attribList = [
+            GlxRgba, GlxDoublebuffer, GlxAlphaSize, 8'i32,
+            GlxRedSize, 8'i32, GlxGreenSize, 8'i32, GlxBlueSize, 8'i32,
+            GlxDepthSize, 0'i32, GlxStencilSize, 0'i32,
+            GlxSampleBuffers, 0'i32, 0'i32
+          ]
+          display.glXChooseVisual(display.defaultScreen, attribList[0].addr)
+        else:
+          var attribList = [
+            GlxRgba, GlxDoublebuffer,
+            GlxRedSize, 8'i32, GlxGreenSize, 8'i32, GlxBlueSize, 8'i32,
+            GlxDepthSize, 0'i32, GlxStencilSize, 0'i32,
+            GlxSampleBuffers, 0'i32, 0'i32
+          ]
+          display.glXChooseVisual(display.defaultScreen, attribList[0].addr)
+      if vis == nil:
+        if style == Transparent:
+          raise WindyError.newException("Transparent GPU pixel windows are not supported")
+        raise WindyError.newException("Error choosing OpenGL visual")
+      vi = vis[]
+      XFree(vis)
+      if style == Transparent and vi.depth < 32:
+        raise WindyError.newException("Transparent GPU pixel windows are not supported")
+    elif not defined(useCpu):
+      let graphics = createContext(style, openglVersion, msaa, depthBits, stencilBits)
+      vi = graphics.visual
+      result.ctx = graphics.context
+    elif style == Transparent:
+      display.XMatchVisualInfo(display.defaultScreen, 32, TrueColor, vi.addr)
     else:
-      raise WindyError.newException("VSync is not supported")
+      display.XMatchVisualInfo(display.defaultScreen, 24, TrueColor, vi.addr)
+      # strangely, glx returns nil when -d:danger
+      # var attribList = [GlxRgba, GlxDepthSize, 24, GlxDoublebuffer]
+      # vi = display.glXChooseVisual(display.defaultScreen, attribList[0].addr)[]
 
-  if visible:
-    result.visible = true
+    result.colormap = display.XCreateColormap(root, vi.visual, AllocNone)
+    var swa = XSetWindowAttributes(colormap: result.colormap)
 
-  block xsync:
-    var vEv, vEr: cint
-    if display.XSyncQueryExtension(vEv.addr, vEr.addr):
-      var vMaj, vMin: cint
-      display.XSyncInitialize(vMaj.addr, vMin.addr)
-      result.xSyncCounter = display.XSyncCreateCounter(XSyncValue())
-      result.handle.setProperty(
-        xaNetWMSyncRequestCounter,
-        xaCardinal,
-        32,
-        @[result.xSyncCounter].asString
-      )
+    result.handle = display.XCreateWindow(
+      root,
+      0, 0,
+      size.x.cuint, size.y.cuint,
+      0,
+      vi.depth.cuint,
+      InputOutput,
+      vi.visual,
+      CwColormap or CwEventMask or CwBorderPixel,
+      swa.addr
+    )
 
-  result.style = style
+    display.XSelectInput(
+      result.handle,
+      ExposureMask or
+      KeyPressMask or
+      KeyReleaseMask or
+      PointerMotionMask or
+      ButtonPressMask or
+      ButtonReleaseMask or
+      StructureNotifyMask or
+      EnterWindowMask or
+      LeaveWindowMask or
+      FocusChangeMask or
+      PropertyChangeMask
+    )
 
-  windows.add result
+    var wmProtocols = [xaWMDeleteWindow, xaNetWMSyncRequest]
+    display.XSetWMProtocols(
+      result.handle, wmProtocols[0].addr, cint wmProtocols.len
+    )
+
+    result.im = display.XOpenIM
+    result.ic = result.im.XCreateIC(
+      "clientWindow",
+      result.handle,
+      "focusWindow",
+      result.handle,
+      "inputStyle",
+      XimPreeditNothing or XimStatusNothing,
+      nil
+    )
+
+    var gcv: XGCValues
+    result.gc = display.XCreateGC(result.handle, GCForeground or GCBackground, gcv.addr)
+
+    if linuxOptions.gpuPixels:
+      # The pixel shaders use a compatibility context.
+      result.ctx = display.glXCreateContext(vi.addr, nil, 1)
+      if result.ctx == nil:
+        raise WindyError.newException("Error creating OpenGL context")
+
+    result.title = title
+
+    # Set a default cursor
+    result.state.cursor = common.Cursor(kind: ArrowCursor)
+    result.applyCursor()
+
+    # Enable XDnD awareness (version 5)
+    const xdndVersion = 5'u32
+    result.handle.setProperty(xaXdndAware, xaCardinal, 32, @[xdndVersion].asString)
+
+    if linuxOptions.gpuPixels:
+      makeContextCurrent result
+      let interval = if vsync: 1'i32 else: 0'i32
+      var configured = false
+      if hasGlxExtension("GLX_EXT_swap_control"):
+        display.glXSwapIntervalEXT(result.handle, interval)
+        configured = true
+      elif hasGlxExtension("GLX_MESA_swap_control"):
+        if glXSwapIntervalMESA(interval.cuint) == 0:
+          configured = true
+      elif vsync and hasGlxExtension("GLX_SGI_swap_control"):
+        if glXSwapIntervalSGI(interval) == 0:
+          configured = true
+      if vsync and not configured:
+        raise WindyError.newException("VSync is not supported")
+      result.gpuPixelVsyncState = vsync and configured
+    elif not defined(useCpu):
+      makeContextCurrent result
+      if vsync:
+        if glXSwapIntervalEXT != nil:
+          display.glXSwapIntervalEXT(result.handle, 1)
+        elif glXSwapIntervalMESA != nil:
+          discard glXSwapIntervalMESA(1)
+        elif glXSwapIntervalSGI != nil:
+          discard glXSwapIntervalSGI(1)
+        else:
+          raise WindyError.newException("VSync is not supported")
+    if visible:
+      result.visible = true
+
+    block xsync:
+      var vEv, vEr: cint
+      if display.XSyncQueryExtension(vEv.addr, vEr.addr):
+        var vMaj, vMin: cint
+        display.XSyncInitialize(vMaj.addr, vMin.addr)
+        result.xSyncCounter = display.XSyncCreateCounter(XSyncValue())
+        result.handle.setProperty(
+          xaNetWMSyncRequestCounter,
+          xaCardinal,
+          32,
+          @[result.xSyncCounter].asString
+        )
+
+    result.style = style
+
+    windows.add result
+  except CatchableError:
+    destroy result
+    raise
+
+proc completeResize(window: Window) =
+  ## Acknowledges a configured resize after its matching frame has been drawn.
+  if window.syncState == SyncConfigured:
+    display.XSyncSetCounter(window.xSyncCounter, window.lastSync)
+    window.syncState = SyncIdle
 
 proc pollEvents(window: Window) =
 
@@ -859,9 +1125,7 @@ proc pollEvents(window: Window) =
   window.perFrame = PerFrame()
   window.buttonPressed = {}
   window.buttonReleased = {}
-
-  # signal that frame was drawn
-  display.XSyncSetCounter(window.xSyncCounter, window.lastSync)
+  window.completeResize()
 
   var ev: XEvent
 
@@ -869,8 +1133,8 @@ proc pollEvents(window: Window) =
     d: Display,
     event: ptr XEvent,
     userData: pointer
-  ): bool {.cdecl.} =
-    event.any.window == cast[Window](userData).handle
+  ): cint {.cdecl.} =
+    cint(event.any.window == cast[Window](userData).handle)
 
   template pushButtonEvent(
     button: Button,
@@ -892,7 +1156,16 @@ proc pollEvents(window: Window) =
   proc handleRune(window: Window, rune: Rune) =
     handleRuneTemplate()
 
-  while display.XCheckIfEvent(ev.addr, checkEvent, cast[pointer](window)):
+  while true:
+    if display.XCheckIfEvent(ev.addr, checkEvent, cast[pointer](window)) == 0:
+      if window.syncState == SyncRequested and
+        epochTime() < window.syncDeadline:
+          # The window manager sends the ConfigureNotify right after the sync
+          # request. Wait for it so the next frame is already the new size.
+          sleep(1)
+          continue
+      break
+
     case ev.kind
 
     of xeClientMessage:
@@ -907,6 +1180,8 @@ proc pollEvents(window: Window) =
           lo: cast[uint32](ev.client.data.l[2]),
           hi: cast[int32](ev.client.data.l[3])
         )
+        window.syncState = SyncRequested
+        window.syncDeadline = epochTime() + syncConfigureTimeout
 
       elif ev.client.messageType == xaXdndEnter:
         # XDnD drag entered.
@@ -944,6 +1219,22 @@ proc pollEvents(window: Window) =
         # XDnD position update.
         if window.xdndVersion > 5:
           continue
+
+        var
+          child: XWindow
+          position: IVec2
+        let packed = ev.client.data.l[2].uint32
+        display.XTranslateCoordinates(
+          display.defaultRootWindow,
+          window.handle,
+          cast[int16](packed shr 16).int32,
+          cast[int16](packed and 0xffff).int32,
+          position.x.addr,
+          position.y.addr,
+          child.addr
+        )
+        window.mousePos = position
+        window.mousePrevPos = position
 
         # Send status back to source.
         let acceptFlag: clong = if window.xdndFormat != 0: 1 else: 0
@@ -990,6 +1281,8 @@ proc pollEvents(window: Window) =
         display.XFlush()
 
     of xeFocusIn:
+      if ev.focus.mode in [NotifyGrab, NotifyUngrab]:
+        continue
       if window.innerFocused:
         return # was duplicated
       window.innerFocused = true
@@ -1009,6 +1302,9 @@ proc pollEvents(window: Window) =
         window.onFocusChange()
 
     of xeFocusOut:
+      if ev.focus.mode in [NotifyGrab, NotifyUngrab]:
+        continue
+      window.releaseMouse()
       if not window.innerFocused:
         return # was duplicated
       window.innerFocused = false
@@ -1039,9 +1335,29 @@ proc pollEvents(window: Window) =
         if window.onFrame != nil:
           window.onFrame()
 
+      if window.syncState == SyncRequested:
+        window.syncState = SyncConfigured
+
+    of xeUnmap:
+      window.releaseMouse()
+
     of xeMotion:
+      if ev.motion.serial < window.mouseSerial:
+        continue
+      if window.warpPending and ev.motion.serial >= window.warpSerial:
+        window.warpPending = false
+        window.capturePos = window.warpPos
+        if not window.mouseCaptured:
+          window.mousePos = window.warpPos
+          window.mousePrevPos = window.warpPos
+        if ev.motion.pos == window.warpPos:
+          continue
       window.mousePrevPos = window.mousePos
-      window.mousePos = ev.motion.pos
+      if window.mouseCaptured:
+        window.mousePos += ev.motion.pos - window.capturePos
+        window.capturePos = ev.motion.pos
+      else:
+        window.mousePos = ev.motion.pos
       window.state.mouseInside = true
       window.perFrame.mouseDelta += window.mousePos - window.mousePrevPos
       if (window.mousePos - window.lastClickPosition).vec2.length > multiClickRadius:
@@ -1060,9 +1376,10 @@ proc pollEvents(window: Window) =
     of xeButtonPress, xeButtonRelease:
 
       template pushScrollEvent(delta: Vec2) =
-        window.perFrame.scrollDelta = delta
-        if window.onScroll != nil:
-          window.onScroll()
+        if ev.kind == xeButtonPress:
+          window.perFrame.scrollDelta += delta
+          if window.onScroll != nil:
+            window.onScroll()
 
       let
         now = getTime()
@@ -1128,18 +1445,17 @@ proc pollEvents(window: Window) =
       # Handle XDnD selection data.
       if ev.selection.property == xaWindyXdndTargetProperty:
         let prop = window.handle.property(xaWindyXdndTargetProperty)
+        var paths: seq[string]
         if prop.data.len > 0:
           # Parse URI list (files separated by newlines).
           let uriList = prop.data
           for line in uriList.splitLines():
             if line.len > 0 and line.startsWith("file://"):
-              # Convert URI to local path and decode percent-encoding.
-              var filePath = decodeUrl(line[7..^1])
-              if window.onFileDrop != nil:
-                let fileContent = readFile(filePath)
-                window.onFileDrop(filePath, fileContent)
+              let location = parseUri(line)
+              if location.hostname.len == 0 or location.hostname == "localhost":
+                paths.add(decodeUrl(location.path, decodePlus = false))
 
-        # Clean up the property.
+        # Finish the native transfer before callbacks can close the window.
         window.handle.delProperty(xaWindyXdndTargetProperty)
 
         # Send finished message.
@@ -1157,8 +1473,28 @@ proc pollEvents(window: Window) =
         window.xdndVersion = 0
         window.xdndFormat = 0
 
+        if paths.len > 0 and window.onFileDropPaths != nil:
+          window.onFileDropPaths(paths)
+        elif window.onFileDrop != nil:
+          for path in paths:
+            if window.closed or window.onFileDrop == nil:
+              break
+            var content = ""
+            try:
+              content = readFile(path)
+            except IOError, OSError:
+              discard
+            window.onFileDrop(path, content)
+        if window.closed:
+          return
+
     else:
       discard
+
+  if window.mouseCaptured and not window.warpPending:
+    let center = window.size div 2
+    if window.capturePos != center:
+      window.warpMouse(center)
 
 proc mousePos*(window: Window): IVec2 =
   window.mousePos
@@ -1178,17 +1514,70 @@ proc mouseCaptured*(window: Window): bool =
   window.mouseCaptured
 
 proc captureMouse*(window: Window) =
-  ## Hide the cursor and report unbounded relative mouse deltas.
+  ## Hides and confines the cursor and reports relative mouse deltas.
   if window.mouseCaptured:
     return
+  if window.closed:
+    raise newException(WindyError, "Cannot capture a closed window")
+  for other in windows:
+    if other.mouseCaptured:
+      raise newException(WindyError, "Another window has captured the mouse")
+  var
+    root, child: XWindow
+    rootPos, pos: IVec2
+    mask: cuint
+  if display.XQueryPointer(
+    window.handle,
+    root.addr,
+    child.addr,
+    rootPos.x.addr,
+    rootPos.y.addr,
+    pos.x.addr,
+    pos.y.addr,
+    mask.addr
+  ) == 0:
+    raise newException(WindyError, "Mouse is on a different X11 screen")
+  let image = XcursorImageCreate(1, 1)
+  if image == nil:
+    raise newException(WindyError, "Unable to create an invisible cursor")
+  defer:
+    XcursorImageDestroy(image)
+  image.pixels[] = 0
+  image.xhot = 0
+  image.yhot = 0
+  let cursor = XcursorImageLoadCursor(display, image)
+  if cursor == 0:
+    raise newException(WindyError, "Unable to load an invisible cursor")
+  defer:
+    display.XFreeCursor(cursor)
+  let status = display.XGrabPointer(
+    window.handle,
+    0,
+    (PointerMotionMask or ButtonPressMask or ButtonReleaseMask).cuint,
+    GrabModeAsync,
+    GrabModeAsync,
+    window.handle,
+    cursor,
+    CurrentTime
+  )
+  case status
+  of GrabSuccess:
+    discard
+  of AlreadyGrabbed:
+    raise newException(WindyError, "Mouse is grabbed by another application")
+  of GrabNotViewable:
+    raise newException(WindyError, "Cannot capture an unmapped window")
+  of GrabFrozen:
+    raise newException(WindyError, "Mouse is frozen by another application")
+  else:
+    raise newException(WindyError, "Unable to grab the X11 mouse pointer")
   window.mouseCaptured = true
-  warn "Mouse capture is not implemented on Linux yet"
-
-proc releaseMouse*(window: Window) =
-  ## Show the cursor and restore normal absolute mouse tracking.
-  if not window.mouseCaptured:
-    return
-  window.mouseCaptured = false
+  window.restorePos = pos
+  window.capturePos = pos
+  window.mousePos = pos
+  window.mousePrevPos = pos
+  window.warpMouse(window.size div 2)
+  window.mouseSerial = window.warpSerial
 
 proc scrollDelta*(window: Window): Vec2 =
   window.perFrame.scrollDelta
@@ -1215,112 +1604,292 @@ proc `closeRequested=`*(window: Window, v: bool) =
       window.onCloseRequest()
 
 proc initClipboard =
+  ## Creates a hidden selection endpoint with property-change notifications.
+  init()
   if clipboardWindow != 0:
     return
   clipboardWindow = display.XCreateSimpleWindow(
     display.defaultRootWindow, 0, 0, 1, 1, 0, 0, 0
   )
+  display.XSelectInput(clipboardWindow, PropertyChangeMask)
 
-proc processClipboardEvents: bool =
+proc clipboardProperty(): tuple[kind: Atom, format: cint, data: string] =
+  ## Reads a bounded selection property and releases Xlib's allocation.
+  var
+    length, bytesAfter: culong
+    data: cstring
+  display.XGetWindowProperty(
+    clipboardWindow,
+    xaWindyClipboardTargetProperty,
+    0,
+    MaxClipboardBytes div 4,
+    false,
+    0,
+    result.kind.addr,
+    result.format.addr,
+    length.addr,
+    bytesAfter.addr,
+    data.addr
+  )
+  defer:
+    if data != nil:
+      XFree(data)
+  if bytesAfter > 0 or length > MaxClipboardBytes.culong:
+    raise newException(WindyError, "The clipboard content is too large.")
+  let size =
+    if result.format == 32:
+      length.int * sizeof(clong)
+    else:
+      length.int * result.format.int div 8
+  if size > MaxClipboardBytes:
+    raise newException(WindyError, "The clipboard content is too large.")
+  result.data = newString(size)
+  if size > 0 and data != nil:
+    copyMem(result.data[0].addr, data, size)
+
+proc sendClipboardData(window: XWindow, property, target: Atom, data: string) =
+  ## Publishes bounded byte content using requests below X11's size limit.
+  if data.len == 0:
+    window.setProperty(property, target, 8, "")
+    return
+  var offset = 0
+  while offset < data.len:
+    let count = min(ClipboardChunkBytes, data.len - offset)
+    display.XChangeProperty(
+      window,
+      property,
+      target,
+      8,
+      if offset == 0: pmReplace else: pmAppend,
+      cast[pointer](data[offset].unsafeAddr),
+      count.cint
+    )
+    offset += count
+
+proc processClipboardEvents() =
+  ## Services selection requests and advances a pending bounded read.
   var ev: XEvent
 
   proc checkEvent(
     d: Display,
     event: ptr XEvent,
     userData: pointer
-  ): bool {.cdecl.} =
-    event.any.window == cast[XWindow](userData)
+  ): cint {.cdecl.} =
+    ## Selects only events belonging to the hidden clipboard endpoint.
+    cint(event.any.window == cast[XWindow](userData))
+
+  proc receiveProperty() =
+    ## Appends one direct or incremental selection payload.
+    try:
+      let value = clipboardProperty()
+      if value.kind == xaIncremental and not clipboardReadIncremental:
+        clipboardReadIncremental = true
+        clipboardReadData.setLen(0)
+      else:
+        let expected =
+          if clipboardReadTarget == xaTargets:
+            value.kind == xaAtom and value.format == 32
+          else:
+            value.kind == clipboardReadTarget and value.format == 8
+        if value.data.len > MaxClipboardBytes - clipboardReadData.len:
+          clipboardReadError = "The clipboard content is too large."
+          clipboardReadFailed = true
+          clipboardReadPending = false
+        elif not expected:
+          clipboardReadFailed = true
+          clipboardReadPending = false
+        else:
+          clipboardReadData.add(value.data)
+          if not clipboardReadIncremental or value.data.len == 0:
+            clipboardReadPending = false
+    except WindyError as error:
+      clipboardReadError = error.msg
+      clipboardReadFailed = true
+      clipboardReadPending = false
+    clipboardWindow.delProperty(xaWindyClipboardTargetProperty)
+    display.XFlush()
 
   while display.XCheckIfEvent(
     ev.addr, checkEvent, cast[pointer](clipboardWindow)
-  ):
+  ) != 0:
     case ev.kind
     of xeSelection:
-      template e: untyped = ev.selection
-
-      if e.property == 0 or e.selection != xaClipboard:
-        continue
-
-      clipboardContent = clipboardWindow.property(
-        xaWindyClipboardTargetProperty
-      ).data
-      clipboardWindow.delProperty(xaWindyClipboardTargetProperty)
-
-      return true
-
+      let event = ev.selection
+      if not clipboardReadPending or event.selection != xaClipboard or
+        event.target != clipboardReadTarget:
+          continue
+      if event.property == 0:
+        clipboardReadFailed = true
+        clipboardReadPending = false
+      elif event.property == xaWindyClipboardTargetProperty:
+        receiveProperty()
+    of xeProperty:
+      if clipboardReadPending and clipboardReadIncremental and
+        ev.property.atom == xaWindyClipboardTargetProperty and
+        ev.property.state == PropertyNewValue:
+          receiveProperty()
     of xeSelectionRequest:
-      template e: untyped = ev.selectionRequest
-
-      var resp = XSelectionEvent(
+      let
+        event = ev.selectionRequest
+        property =
+          if event.property == 0:
+            event.target
+          else:
+            event.property
+      var response = XSelectionEvent(
         kind: xeSelection,
-        requestor: e.requestor,
-        selection: e.selection,
-        property: e.property,
-        target: e.target,
-        time: e.time
+        requestor: event.requestor,
+        selection: event.selection,
+        property: property,
+        target: event.target,
+        time: event.time
       )
-
-      if e.selection == xaClipboard:
-        if e.target == xaTargets:
-          # request requests that we can handle
-          e.requestor.setProperty(e.property, xaAtom, 32, @[
-            xaTargets,
-            xaText,
-            xaString,
-            xaUTF8String
-          ].asString)
-          e.requestor.send(XEvent(selection: resp), propagate = true)
-          continue
-
-        elif e.target in {xaString, xaText, xaUTF8String}:
-          # request clipboard data
-          e.requestor.setProperty(e.property, xaAtom, 8, clipboardContent)
-          e.requestor.send(XEvent(selection: resp), propagate = true)
-          continue
-
-      # we can't handle this request
-      resp.property = 0
-      e.requestor.send(XEvent(selection: resp), propagate = true)
-
+      if event.selection == xaClipboard:
+        if event.target == xaTargets:
+          var targets = @[xaTargets]
+          if clipboardImage.len > 0:
+            targets.add(xaImagePng)
+          else:
+            targets.add([xaText, xaString, xaUTF8String])
+          display.XChangeProperty(
+            event.requestor,
+            property,
+            xaAtom,
+            32,
+            pmReplace,
+            cast[pointer](targets[0].addr),
+            targets.len.cint
+          )
+        elif event.target == xaImagePng and clipboardImage.len > 0:
+          event.requestor.sendClipboardData(
+            property, xaImagePng, clipboardImage
+          )
+        elif event.target in [xaString, xaText, xaUTF8String] and
+          clipboardImage.len == 0:
+            event.requestor.sendClipboardData(
+              property, event.target, clipboardContent
+            )
+        else:
+          response.property = 0
+      else:
+        response.property = 0
+      event.requestor.send(XEvent(selection: response), propagate = false)
+      display.XFlush()
     else:
       discard
 
-proc getClipboardString*: string =
+proc readClipboard(target: Atom): string =
+  ## Requests one selection target with a finite wait and byte budget.
   initClipboard()
   if display.XGetSelectionOwner(xaClipboard) == 0:
-    return ""
+    return
+  clipboardReadTarget = target
+  clipboardReadPending = true
+  clipboardReadIncremental = false
+  clipboardReadFailed = false
+  clipboardReadError.setLen(0)
+  clipboardReadData.setLen(0)
+  clipboardWindow.delProperty(xaWindyClipboardTargetProperty)
+  display.XConvertSelection(
+    xaClipboard, target, xaWindyClipboardTargetProperty, clipboardWindow
+  )
+  display.XFlush()
+  let started = getMonoTime()
+  while clipboardReadPending:
+    processClipboardEvents()
+    if (getMonoTime() - started).inMilliseconds >= ClipboardTimeoutMs:
+      clipboardReadFailed = true
+      clipboardReadError = "The clipboard owner did not respond in time."
+      break
+    if clipboardReadPending:
+      sleep(1)
+  clipboardReadPending = false
+  clipboardReadIncremental = false
+  clipboardWindow.delProperty(xaWindyClipboardTargetProperty)
+  if not clipboardReadFailed:
+    result = move(clipboardReadData)
+  clipboardReadData.setLen(0)
+  if clipboardReadError.len > 0:
+    raise newException(WindyError, clipboardReadError)
 
+proc getClipboardString*(): string =
+  ## Reads UTF-8 text without waiting forever on unavailable clipboard owners.
+  initClipboard()
   if display.XGetSelectionOwner(xaClipboard) == clipboardWindow:
     return clipboardContent
+  readClipboard(xaUTF8String)
 
-  display.XConvertSelection(
-    xaClipboard,
-    xaUTF8String,
-    xaWindyClipboardTargetProperty,
-    clipboardWindow
-  )
-
-  while not processClipboardEvents(): discard
-  result = clipboardContent
-  clipboardContent = ""
-
-proc setClipboardString*(s: string) =
+proc setClipboardString*(text: string) =
+  ## Publishes UTF-8 text and clears any previous image representation.
   initClipboard()
-  clipboardContent = s
+  if text.len > MaxClipboardBytes:
+    raise newException(WindyError, "The clipboard content is too large.")
+  clipboardContent = text
+  clipboardImage.setLen(0)
   display.XSetSelectionOwner(xaClipboard, clipboardWindow)
+  display.XFlush()
 
 proc getClipboardContentKinds*(): set[ClipboardContentKind] =
-  ## Image clipboard is not implemented on X11 yet.
-  discard
+  ## Checks advertised UTF-8 text and PNG image targets.
+  initClipboard()
+  if display.XGetSelectionOwner(xaClipboard) == clipboardWindow:
+    if clipboardImage.len > 0:
+      return {ImageContent}
+    return {TextContent}
+  let targets = readClipboard(xaTargets).asSeq(Atom)
+  if xaUTF8String in targets:
+    result.incl(TextContent)
+  if xaImagePng in targets:
+    result.incl(ImageContent)
 
 proc getClipboardImage*(): Image =
-  ## Image clipboard is not implemented on X11 yet.
-  nil
+  ## Decodes a bounded PNG image from the current X11 selection owner.
+  initClipboard()
+  let data =
+    if display.XGetSelectionOwner(xaClipboard) == clipboardWindow:
+      clipboardImage
+    else:
+      readClipboard(xaImagePng)
+  if data.len == 0:
+    return
+  try:
+    let dimensions = decodeImageDimensions(data)
+    if dimensions.width <= 0 or dimensions.height <= 0 or
+      dimensions.width > MaxClipboardPixels div dimensions.height:
+        raise newException(WindyError, "The clipboard image is too large.")
+    result = decodeImage(data)
+  except PixieError as error:
+    raise newException(WindyError, "Could not decode clipboard image: " & error.msg)
 
-proc pollEvents*() =
+proc setClipboardImage*(image: Image) {.raises: [WindyError].} =
+  ## Publishes a PNG image through the native X11 clipboard selection.
+  if image == nil or image.width <= 0 or image.height <= 0:
+    raise newException(WindyError, "Cannot copy an empty clipboard image.")
+  if image.width > MaxClipboardPixels div image.height:
+    raise newException(WindyError, "The clipboard image is too large.")
+  var data: string
+  try:
+    data = image.encodeImage(PngFormat)
+  except PixieError as error:
+    raise newException(WindyError, "Could not encode clipboard image: " & error.msg)
+  if data.len > MaxClipboardBytes:
+    raise newException(WindyError, "The clipboard image is too large.")
+  initClipboard()
+  clipboardImage = move(data)
+  clipboardContent.setLen(0)
+  display.XSetSelectionOwner(xaClipboard, clipboardWindow)
+  display.XFlush()
+
+proc waitEvents*(timeoutMs: int) =
+  ## Draws pending frames, then waits up to the given milliseconds for events.
+  ## Zero polls without waiting. Call this on the window thread.
+  pollNotificationEvents()
+  pollTrayEvents()
   for window in windows:
     if window.onFrame != nil:
       window.onFrame()
+    if not window.closed:
+      window.completeResize()
 
   let ws = windows
   windows = @[]
@@ -1331,13 +1900,53 @@ proc pollEvents*() =
     else:
       windows.add window
 
+  var timeout = notificationWaitTimeout(trayWaitTimeout(
+    httpWaitTimeout(timeoutMs)
+  ))
+  if display != nil:
+    proc unownedEvent(
+      connection: Display, event: ptr XEvent, data: pointer
+    ): cint {.cdecl.} =
+      ## Drops only events that no active Windy window or clipboard can read.
+      if clipboardWindow != 0 and event.any.window == clipboardWindow:
+        return 0
+      for window in windows:
+        if event.any.window == window.handle:
+          return 0
+      1
+
+    var event: XEvent
+    while display.XCheckIfEvent(addr event, unownedEvent, nil) != 0:
+      discard
+    for window in windows:
+      if window.syncState == SyncRequested and
+        epochTime() < window.syncDeadline:
+          timeout = min(timeout, max(
+            0, int(ceil((window.syncDeadline - epochTime()) * 1000))
+          ))
+    if display.XPending() > 0:
+      timeout = 0
+    waitNativeEvents(timeout, [display.fd])
+  else:
+    waitNativeEvents(timeout, [])
+
+  pollNotificationEvents()
+  pollTrayEvents()
   if clipboardWindow != 0:
-    discard processClipboardEvents()
+    processClipboardEvents()
 
   for window in windows:
     pollEvents(window)
 
   pollHttp()
+
+proc wakeEvents*() {.raises: [], gcsafe.} =
+  ## Wakes native waiting from any thread after the first window is created.
+  wakeNativeEvents()
+
+proc pollEvents*() =
+  ## Draws pending frames and dispatches events without waiting.
+  waitEvents(0)
 
 proc closeIme*(window: Window) =
   discard
@@ -1459,3 +2068,78 @@ proc saveFileDialog*(
     args.add("--file-filter=" & filter.name & " | " &
       filter.extensions.replace(";", " ").replace(",", " "))
   result = runZenity(args)
+
+proc touches*(window: Window): seq[TouchContact] =
+  @[]
+when defined(useCpu):
+  const NativeByteOrder = when cpuEndian == littleEndian: 0 else: 1
+
+  type CpuImage = object
+    width, height, xoffset, format: cint
+    data: cstring
+    byteOrder, bitmapUnit, bitmapBitOrder, bitmapPad, depth: cint
+    bytesPerLine, bitsPerPixel: cint
+    redMask, greenMask, blueMask: culong
+    obdata: pointer
+    functions: array[6, pointer]
+  proc createImage(d: Display, visual: ptr Visual, depth: cuint, format: cint,
+    offset: cint, data: cstring, width, height: cuint, pad, stride: cint): ptr CpuImage
+    {.cdecl, importc: "XCreateImage", dynlib: libX11.}
+  proc putImage(d: Display, window: XWindow, gc: GC, image: ptr CpuImage,
+    sx, sy, dx, dy: cint, width, height: cuint): cint
+    {.cdecl, importc: "XPutImage", dynlib: libX11.}
+  proc putPixel(image: ptr CpuImage, x, y: cint, pixel: culong): cint
+    {.cdecl, importc: "XPutPixel", dynlib: libX11.}
+  proc destroyImage(image: ptr CpuImage): cint
+    {.cdecl, importc: "XDestroyImage", dynlib: libX11.}
+  proc malloc(size: csize_t): pointer {.importc, header: "<stdlib.h>".}
+
+  proc channel(value: uint8, mask: culong): culong =
+    var bits = mask
+    var shift = 0
+    while bits != 0 and (bits and 1) == 0:
+      bits = bits shr 1
+      inc shift
+    ((culong(value) * bits + 127) div 255 shl shift) and mask
+
+  proc presentPixels*(window: Window, image: Image) =
+    if window.closed:
+      raise newException(WindyError, "Cannot present to a closed window")
+    if image == nil or image.width <= 0 or image.height <= 0:
+      raise newException(WindyError, "Invalid pixel image")
+    var attributes: XWindowAttributes
+    display.XGetWindowAttributes(window.handle, addr attributes)
+    let native = createImage(display, attributes.visual, cuint(attributes.depth),
+      2, 0, nil, cuint(image.width), cuint(image.height), 32, 0)
+    if native == nil:
+      raise newException(WindyError, "Cannot create X11 pixel image")
+    defer: discard destroyImage(native)
+    native.data = cast[cstring](malloc(csize_t(native.bytesPerLine) * csize_t(image.height)))
+    if native.data == nil:
+      raise newException(WindyError, "Cannot allocate X11 pixel image")
+    let direct = native.bitsPerPixel == 32 and native.byteOrder == NativeByteOrder
+    var channels: array[3, array[256, culong]]
+    for value in 0 .. 255:
+      channels[0][value] = channel(uint8(value), native.redMask)
+      channels[1][value] = channel(uint8(value), native.greenMask)
+      channels[2][value] = channel(uint8(value), native.blueMask)
+    let destination = cast[ptr UncheckedArray[byte]](native.data)
+    for y in 0 ..< image.height:
+      let row = cast[ptr UncheckedArray[uint32]](addr destination[y * int(native.bytesPerLine)])
+      for x in 0 ..< image.width:
+        let
+          pixel = image.data[y * image.width + x]
+          packed = channels[0][pixel.r] or channels[1][pixel.g] or channels[2][pixel.b]
+        if direct:
+          row[x] = uint32(packed)
+        else:
+          discard putPixel(native, cint(x), cint(y), packed)
+    discard putImage(display, window.handle, window.gc, native, 0, 0, 0, 0,
+      cuint(image.width), cuint(image.height))
+    display.XFlush()
+
+proc hasWindows*(): bool =
+  for window in windows:
+    if not window.closed: return true
+
+include x11/pixels

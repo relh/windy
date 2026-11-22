@@ -3,6 +3,9 @@ import
   pixie/fileformats/png, pixie/images, utils, vmath,
   ../../[common, internal], macdefs
 
+from pixie/common import PixieError
+from pixie import Rect
+
 when defined(useMetal4):
   {.hint: "Using Metal backend".}
 elif defined(useCpu):
@@ -16,9 +19,22 @@ import ../../http
 export http
 
 type
+  FullscreenRestore = object
+    frame: NSRect
+    style: NSWindowStyleMask
+    level: NSWindowLevel
+    movable, shadow, hides, mouseMoved: bool
+
+  MouseConfinement = object
+    requested, fullWindow, active, updating: bool
+    region: Rect
+    cachedFrame, cachedBounds, cachedBacking: NSRect
+    controlsLocked, savedMovable, savedResizable: bool
+
   Window* = ref object
     onCloseRequest*: Callback
     onFrame*: Callback
+    onTouch*: TouchCallback
     onMove*: Callback
     onResize*: Callback
     onFocusChange*: Callback
@@ -27,8 +43,11 @@ type
     onButtonPress*: ButtonCallback
     onButtonRelease*: ButtonCallback
     onRune*: RuneCallback
+    onTextInput*: TextInputCallback
+    onTextEdit*: TextInputEditCallback
     onImeChange*: Callback
     onFileDrop*: FileDropCallback
+    onFileDropPaths*: FileDropPathsCallback
     imePos*: IVec2
 
     state: WindowState
@@ -36,10 +55,14 @@ type
     inner: NSWindow
     trackingArea: NSTrackingArea
     markedText: NSString
-    # AppKit applies this state asynchronously via delegate callbacks.
-    fullscreenState: bool
+    fullscreenState, fullscreenChanging, fullscreenUpdating: bool
+    fullscreenResized, fullscreenMoved: bool
+    fullscreenRestore: FullscreenRestore
+    confinement: MouseConfinement
+    closing: bool
     minimizedState: bool
     cpuImage: NSImage
+    textInput: TextInputState
 
 const
   ActivationTurnSeconds = 0.001
@@ -61,8 +84,9 @@ var
   # is in the future, pollEvents re-requests activation until it succeeds.
   activationRescueDeadline: float64
 
-proc drainEvents()
+proc drainEvents(timeoutMs = 0)
 proc pumpActivation()
+proc readPasteboardImage(pboard: NSPasteboard): Image
 
 objc:
   proc initWithFrame(self: NSView, x: NSRect): NSView
@@ -119,6 +143,27 @@ proc contentScale*(window: Window): float32 =
       backing = contentView.convertRectToBacking(frame)
     result = backing.size.width / frame.size.width
 
+proc updateBackingScale(window: Window, scale: float32) =
+  ## Keeps cached pointer pixels in the current backing scale without events.
+  if not (scale > 0) or scale == window.state.contentScale:
+    return
+  let previous = window.state.contentScale
+  window.state.contentScale = scale
+  if previous <= 0:
+    return
+  let ratio = scale / previous
+  proc rescaled(position: IVec2): IVec2 =
+    ## Converts cached pixel coordinates without changing their logical point.
+    ivec2(
+      round(position.x.float32 * ratio).int32,
+      round(position.y.float32 * ratio).int32
+    )
+  window.state.mousePos = rescaled(window.state.mousePos)
+  window.state.mousePrevPos = rescaled(window.state.mousePrevPos)
+  window.state.perFrame.mouseDelta = rescaled(window.state.perFrame.mouseDelta)
+  for position in window.state.multiClickPositions.mitems:
+    position = rescaled(position)
+
 proc size*(window: Window): IVec2 =
   autoreleasepool:
     let
@@ -145,6 +190,9 @@ proc maximized*(window: Window): bool =
 
 proc focused*(window: Window): bool =
   window.inner.isKeyWindow
+
+include confinement
+include fullscreens
 
 proc closeIme*(window: Window) =
   if not window.focused:
@@ -194,17 +242,27 @@ proc `visible=`*(window: Window, visible: bool) =
       pumpActivation()
     else:
       activationRescueDeadline = 0
+      window.suspendMouseConfinement()
+      if window.state.closed:
+        return
       window.inner.orderOut(0.ID)
+      updateFullscreenPresentation()
 
 proc `style=`*(window: Window, windowStyle: WindowStyle) =
+  if window.fullscreenState:
+    return
   autoreleasepool:
-    case windowStyle:
-    of DecoratedResizable:
-      window.inner.setStyleMask(decoratedResizableWindowMask)
-    of Decorated:
-      window.inner.setStyleMask(decoratedWindowMask)
-    of Undecorated, Transparent:
-      window.inner.setStyleMask(undecoratedWindowMask)
+    let mask = case windowStyle:
+      of DecoratedResizable: decoratedResizableWindowMask
+      of Decorated: decoratedWindowMask
+      of Undecorated, Transparent: undecoratedWindowMask
+    window.suspendMouseConfinement()
+    if window.state.closed:
+      return
+    window.inner.setStyleMask(mask)
+    if window.state.closed:
+      return
+    discard window.inner.makeFirstResponder(window.inner.contentView)
 
     when defined(useMetal4) or defined(useCpu):
       if windowStyle == Transparent:
@@ -218,12 +276,15 @@ proc `style=`*(window: Window, windowStyle: WindowStyle) =
         )
 
 proc `fullscreen=`*(window: Window, fullscreen: bool) =
-  if window.fullscreen == fullscreen:
-    return
-  autoreleasepool:
-    window.inner.toggleFullScreen(0.ID)
+  ## Covers the display without creating a separate macOS fullscreen Space.
+  window.setFullscreen(fullscreen)
 
 proc `floating=`*(window: Window, floating: bool) =
+  if window.fullscreenState:
+    window.fullscreenRestore.level =
+      if floating: NSFloatingWindowLevel
+      else: NSNormalWindowLevel
+    return
   if window.floating == floating:
     return
   autoreleasepool:
@@ -235,6 +296,11 @@ proc `floating=`*(window: Window, floating: bool) =
     window.inner.setLevel(level)
 
 proc `size=`*(window: Window, size: IVec2) =
+  if window.fullscreenState:
+    return
+  window.suspendMouseConfinement()
+  if window.state.closed:
+    return
   autoreleasepool:
     let virtualSize = (size.vec2 / window.contentScale)
 
@@ -246,6 +312,11 @@ proc `size=`*(window: Window, size: IVec2) =
     window.inner.setFrame(frameRect, true)
 
 proc `pos=`*(window: Window, pos: IVec2) =
+  if window.fullscreenState:
+    return
+  window.suspendMouseConfinement()
+  if window.state.closed:
+    return
   autoreleasepool:
     let
       windowFrame = window.inner.frame
@@ -259,12 +330,18 @@ proc `pos=`*(window: Window, pos: IVec2) =
 proc `minimized=`*(window: Window, minimized: bool) =
   autoreleasepool:
     if minimized and not window.minimized:
+      window.suspendMouseConfinement()
+      if window.state.closed:
+        return
       window.inner.miniaturize(0.ID)
     elif not minimized and window.minimized:
       window.inner.deminiaturize(0.ID)
 
 proc `maximized=`*(window: Window, maximized: bool) =
-  if window.maximized == maximized:
+  if window.fullscreenState or window.maximized == maximized:
+    return
+  window.suspendMouseConfinement()
+  if window.state.closed:
     return
   autoreleasepool:
     window.inner.zoom(0.ID)
@@ -272,6 +349,8 @@ proc `maximized=`*(window: Window, maximized: bool) =
 proc `closeRequested=`*(window: Window, closeRequested: bool) =
   window.state.closeRequested = closeRequested
   if closeRequested:
+    window.suspendMouseConfinement()
+    updateFullscreenPresentation()
     if window.onCloseRequest != nil:
       window.onCloseRequest()
 
@@ -291,6 +370,8 @@ proc mouseCaptured*(window: Window): bool =
 
 proc warpCursorToCenter(window: Window) =
   ## Move the system cursor to the window content center.
+  let scale = window.contentScale
+  window.updateBackingScale(scale)
   let
     view = window.inner.contentView
     bounds = view.bounds
@@ -301,12 +382,16 @@ proc warpCursorToCenter(window: Window) =
     primary = NSScreen.screens.objectAtIndex(0).NSScreen.frame
     cgY = primary.origin.y + primary.size.height - inScreen.y
   cgWarpMouseCursorPosition(inScreen.x, cgY)
-  window.state.mousePos = (vec2(local.x, local.y) * window.contentScale).ivec2
+  window.state.mousePos = (vec2(local.x, local.y) * scale).ivec2
   window.state.mousePrevPos = window.state.mousePos
   window.state.hasPrevMouse = false
 
 proc captureMouse*(window: Window) =
   ## Hide the cursor and report unbounded relative mouse deltas.
+  window.releaseMouseConfinement()
+  if window.state.closed:
+    return
+  window.confinement.requested = false
   if window.state.mouseCaptured:
     return
   window.state.mouseCaptured = true
@@ -329,6 +414,8 @@ proc url*(window: Window): string =
 
 proc handleMouseMove(window: Window, location: NSPoint) =
   ## Updates pixel coordinates and containment from unrounded view points.
+  let scale = window.contentScale
+  window.updateBackingScale(scale)
   let
     bounds = window.inner.contentView.bounds
     x = location.x
@@ -336,7 +423,7 @@ proc handleMouseMove(window: Window, location: NSPoint) =
 
   window.state.mousePrevPos = window.state.mousePos
   window.state.mousePos =
-    (vec2(round(x), round(y)) * window.contentScale).ivec2
+    (vec2(round(x), round(y)) * scale).ivec2
   window.state.mouseInside =
     x >= 0 and x < bounds.size.width and
     y >= 0 and y < bounds.size.height
@@ -354,12 +441,25 @@ proc handleMouseMove(window: Window, location: NSPoint) =
 proc handleMouseDelta(window: Window, event: NSEvent) =
   ## Relative deltas while captured. NSEvent deltaY is up-positive.
   let scale = window.contentScale
+  window.updateBackingScale(scale)
   window.state.perFrame.mouseDelta += ivec2(
     round(event.deltaX * scale).int32,
     round(-event.deltaY * scale).int32
   )
   if window.onMouseMove != nil:
     window.onMouseMove()
+
+proc updateMousePosition(window: Window, event: NSEvent) =
+  ## Updates button positions without changing captured pointer state.
+  let scale = window.contentScale
+  window.updateBackingScale(scale)
+  if window.state.mouseCaptured:
+    return
+  let
+    location = event.locationInWindow()
+    height = window.inner.contentView.bounds.size.height
+  window.state.mousePos = (vec2(round(location.x), round(height - location.y)) *
+    scale).ivec2
 
 proc handleButtonPress(window: Window, button: Button) =
   handleButtonPressTemplate()
@@ -369,6 +469,10 @@ proc handleButtonRelease(window: Window, button: Button) =
 
 proc handleRune(window: Window, rune: Rune) =
   handleRuneTemplate()
+
+proc handleTextInput(window: Window, text: string) =
+  ## Delivers a complete native text insertion without synthesizing keys.
+  handleTextInputTemplate(text)
 
 proc createMenuBar() =
   let
@@ -403,17 +507,37 @@ proc applicationDidFinishLaunching(
 ): ID {.cdecl.} =
   NSApp.setPresentationOptions(NSApplicationPresentationDefault)
 
+proc applicationActivityChanged(
+  self: ID,
+  cmd: SEL,
+  notification: NSNotification
+): ID {.cdecl.} =
+  ## Restores desktop presentation immediately when app activity changes.
+  if not NSApp.isActive:
+    let pending = windows
+    for window in pending:
+      window.suspendMouseConfinement()
+  updateFullscreenWindows()
+
 proc windowDidResize(
   self: ID,
   cmd: SEL,
   notification: NSNotification
 ): ID {.cdecl.} =
   let window = windows.forNSWindow(self.NSWindow)
-  if window == nil:
+  if window == nil or window.closing:
+    return
+  window.updateBackingScale(window.contentScale)
+  if window.fullscreenChanging:
+    window.fullscreenResized = true
+    return
+  if not window.confinement.updating:
+    window.suspendMouseConfinement()
+  if window.state.closed:
     return
   if window.onResize != nil:
     window.onResize()
-  if window.onFrame != nil:
+  if not window.state.closed and window.onFrame != nil:
     window.onFrame()
 
 proc windowDidMove(
@@ -422,7 +546,17 @@ proc windowDidMove(
   notification: NSNotification
 ): ID {.cdecl.} =
   let window = windows.forNSWindow(self.NSWindow)
-  if window != nil and window.onMove != nil:
+  if window == nil or window.closing:
+    return
+  window.updateBackingScale(window.contentScale)
+  if window.fullscreenChanging:
+    window.fullscreenMoved = true
+    return
+  if not window.confinement.updating:
+    window.suspendMouseConfinement()
+  if window.state.closed:
+    return
+  if window.onMove != nil:
     window.onMove()
 
 proc windowDidMiniaturize(
@@ -434,6 +568,8 @@ proc windowDidMiniaturize(
   if window == nil:
     return
   window.minimizedState = true
+  window.suspendMouseConfinement()
+  updateFullscreenWindows()
 
 proc windowDidDeminiaturize(
   self: ID,
@@ -444,28 +580,23 @@ proc windowDidDeminiaturize(
   if window == nil:
     return
   window.minimizedState = false
+  updateFullscreenWindows()
 
-proc windowDidEnterFullScreen(
+proc toggleWindyFullscreen(
   self: ID,
   cmd: SEL,
-  notification: NSNotification
-): ID {.cdecl.} =
+  sender: ID
+) {.cdecl.} =
+  ## Routes native fullscreen actions through Windy's borderless mode.
   let window = windows.forNSWindow(self.NSWindow)
-  if window == nil:
-    return
-  window.fullscreenState = true
-
-proc windowDidExitFullScreen(
-  self: ID,
-  cmd: SEL,
-  notification: NSNotification
-): ID {.cdecl.} =
-  let window = windows.forNSWindow(self.NSWindow)
-  if window == nil:
-    return
-  window.fullscreenState = false
+  if window != nil:
+    window.fullscreen = not window.fullscreen
 
 proc canBecomeKeyWindow(self: ID, cmd: SEL): bool {.cdecl.} =
+  true
+
+proc canBecomeMainWindow(self: ID, cmd: SEL): bool {.cdecl.} =
+  ## Allows borderless Windy windows to remain the application's main window.
   true
 
 const
@@ -512,6 +643,10 @@ proc syncModifierClass(
     # Some virtual keyboards omit the device bits; fall back to treating the
     # changed key as the pressed one without disturbing its sibling.
     window.syncModifierButton(changed, true)
+  elif leftButton notin window.state.buttonDown and
+    rightButton notin window.state.buttonDown:
+      # Synthetic key events may provide only the aggregate modifier bit.
+      window.syncModifierButton(leftButton, true)
 
 proc syncModifierState(window: Window, flags: uint, changed = ButtonUnknown) =
   window.syncModifierClass(
@@ -542,16 +677,23 @@ proc windowDidBecomeKey(
   notification: NSNotification
 ): ID {.cdecl.} =
   let window = windows.forNSWindow(self.NSWindow)
-  if window == nil:
+  if window == nil or window.closing:
     return
   clearButtonsTemplate()
+  if window.state.closed:
+    return
   # Seed the modifier keys from the current hardware state so a modifier held
   # across the focus gain (Cmd-Tab, focus stolen mid-chord) is tracked as
   # down and its upcoming release cannot register as a phantom press.
   window.syncModifierState(NSEvent.modifierFlags())
+  if window.state.closed:
+    return
+  updateFullscreenWindows()
+  if window.state.closed:
+    return
   if window.onFocusChange != nil:
     window.onFocusChange()
-  if not window.state.mouseCaptured:
+  if not window.state.closed and not window.state.mouseCaptured:
     handleMouseMove(window, window.inner.mouseLocationOutsideOfEventStream)
 
 proc windowDidResignKey(
@@ -560,15 +702,18 @@ proc windowDidResignKey(
   notification: NSNotification
 ): ID {.cdecl.} =
   let window = windows.forNSWindow(self.NSWindow)
-  if window == nil:
+  if window == nil or window.closing:
     return
+  window.suspendMouseConfinement()
+  window.releaseMouse()
+  updateFullscreenWindows()
   clearButtonsTemplate()
+  if window.state.closed:
+    return
   if window.onFocusChange != nil:
     window.onFocusChange()
   # When loosing focus, prev mouse position is not valid.
   window.state.hasPrevMouse = false
-  # Alt-tab and focus loss always release capture.
-  window.releaseMouse()
 
 proc windowShouldClose(
   self: ID,
@@ -591,14 +736,22 @@ proc acceptsFirstMouse(self: ID, cmd: SEL, event: NSEvent): bool {.cdecl.} =
   true
 
 proc viewDidChangeBackingProperties(self: ID, cmd: SEL): ID {.cdecl.} =
-  callSuper(self, cmd)
-
   let window = windows.forNSWindow(self.NSview.window)
-  if window == nil:
+  if window != nil and not window.closing:
+    window.updateBackingScale(window.contentScale)
+  callSuper(self, cmd)
+  if window == nil or window.closing:
+    return
+  if window.fullscreenChanging:
+    window.fullscreenResized = true
+    return
+  if not window.confinement.updating:
+    window.suspendMouseConfinement()
+  if window.state.closed:
     return
   if window.onResize != nil:
     window.onResize()
-  if window.onFrame != nil:
+  if not window.state.closed and window.onFrame != nil:
     window.onFrame()
 
 proc updateTrackingAreas(self: ID, cmd: SEL): ID {.cdecl.} =
@@ -658,36 +811,88 @@ proc draggingEntered(
   cmd: SEL,
   sender: NSDraggingInfo
 ): NSDragOperation {.cdecl.} =
-  ## Accept Finder file drops onto the content view.
-  let pboard = sender.draggingPasteboard()
-  let types = pboard.types()
-  if types.int != 0 and types.containsObject(NSFilenamesPboardType.ID):
-    return NSDragOperationCopy
+  ## Accepts native file drops and updates their window-relative position.
+  let window = windows.forNSWindow(self.NSView.window)
+  if window == nil or
+    (window.onFileDrop == nil and window.onFileDropPaths == nil):
+      return NSDragOperationNone
+  handleMouseMove(window, sender.draggingLocation())
+  let
+    pboard = sender.draggingPasteboard()
+    types = pboard.types()
+  if types.int != 0 and
+    (types.containsObject(NSFilenamesPboardType.ID) or
+    types.containsObject(NSPasteboardTypeFileURL.ID) or
+    (window.onFileDrop != nil and
+    (types.containsObject(NSPasteboardTypePNG.ID) or
+    types.containsObject(NSPasteboardTypeTIFF.ID)))):
+      return NSDragOperationCopy
   NSDragOperationNone
+
+proc pasteboardFilePaths(pboard: NSPasteboard): seq[string] =
+  ## Reads local file URLs with a fallback for legacy Finder pasteboards.
+  let urls = pboard.readObjectsForClasses(
+    NSArray.arrayWithObject(NSURL.getClass().ID),
+    0.NSDictionary
+  )
+  for i in 0 ..< urls.count.int:
+    let url = urls[i].NSURL
+    if url.isFileURL():
+      let path = $url.path()
+      if path.len > 0:
+        result.add(path)
+  if result.len > 0:
+    return
+  let list = pboard.propertyListForType(NSFilenamesPboardType).NSArray
+  for i in 0 ..< list.count.int:
+    let path = $list[i].NSString
+    if path.len > 0:
+      result.add(path)
+
+proc deliverFileDrop(window: Window, paths: seq[string]) =
+  ## Prefers path delivery so applications can bound their own file reads.
+  if window.onFileDropPaths != nil:
+    window.onFileDropPaths(paths)
+  elif window.onFileDrop != nil:
+    for path in paths:
+      if window.state.closed or window.onFileDrop == nil:
+        break
+      var data: string
+      try:
+        data = readFile(path)
+      except IOError, OSError:
+        discard
+      window.onFileDrop(path, data)
+
+proc deliverPasteboardDrop(window: Window, pboard: NSPasteboard): bool =
+  ## Delivers local file paths or PNG bytes for pathless native image drops.
+  let paths = pasteboardFilePaths(pboard)
+  if paths.len > 0:
+    window.deliverFileDrop(paths)
+    return true
+  if window.onFileDrop != nil:
+    let image = readPasteboardImage(pboard)
+    if image != nil:
+      var encoded: string
+      try:
+        encoded = image.encodePng()
+      except PixieError:
+        return false
+      window.onFileDrop("Dropped image.png", encoded)
+      return true
 
 proc performDragOperation(
   self: ID,
   cmd: SEL,
   sender: NSDraggingInfo
 ): bool {.cdecl.} =
-  ## Deliver dropped file paths and contents to onFileDrop.
+  ## Updates the native drop location before invoking application callbacks.
   let window = windows.forNSWindow(self.NSView.window)
-  if window == nil or window.onFileDrop == nil:
-    return false
-  let
-    pboard = sender.draggingPasteboard()
-    list = pboard.propertyListForType(NSFilenamesPboardType).NSArray
-  if list.int == 0:
-    return false
-  for i in 0 ..< list.count.int:
-    let path = $list[i].NSString
-    if path.len == 0:
-      continue
-    try:
-      window.onFileDrop(path, readFile(path))
-    except CatchableError:
-      window.onFileDrop(path, "")
-  true
+  if window == nil or
+    (window.onFileDrop == nil and window.onFileDropPaths == nil):
+      return false
+  handleMouseMove(window, sender.draggingLocation())
+  window.deliverPasteboardDrop(sender.draggingPasteboard())
 
 proc mouseDragged(self: ID, cmd: SEL, event: NSEvent): ID {.cdecl.} =
   mouseMoved(self, cmd, event)
@@ -728,24 +933,28 @@ proc mouseDown(self: ID, cmd: SEL, event: NSEvent): ID {.cdecl.} =
   let window = windows.forNSWindow(self.NSView.window)
   if window == nil:
     return
+  window.updateMousePosition(event)
   window.handleButtonPress(MouseLeft)
 
 proc mouseUp(self: ID, cmd: SEL, event: NSEvent): ID {.cdecl.} =
   let window = windows.forNSWindow(self.NSView.window)
   if window == nil:
     return
+  window.updateMousePosition(event)
   window.handleButtonRelease(MouseLeft)
 
 proc rightMouseDown(self: ID, cmd: SEL, event: NSEvent): ID {.cdecl.} =
   let window = windows.forNSWindow(self.NSView.window)
   if window == nil:
     return
+  window.updateMousePosition(event)
   window.handleButtonPress(MouseRight)
 
 proc rightMouseUp(self: ID, cmd: SEL, event: NSEvent): ID {.cdecl.} =
   let window = windows.forNSWindow(self.NSView.window)
   if window == nil:
     return
+  window.updateMousePosition(event)
   window.handleButtonRelease(MouseRight)
 
 proc otherMouseDown(self: ID, cmd: SEL, event: NSEvent): ID {.cdecl.} =
@@ -755,10 +964,13 @@ proc otherMouseDown(self: ID, cmd: SEL, event: NSEvent): ID {.cdecl.} =
 
   case event.buttonNumber:
   of 2:
+    window.updateMousePosition(event)
     window.handleButtonPress(MouseMiddle)
   of 3:
+    window.updateMousePosition(event)
     window.handleButtonPress(MouseButton4)
   of 4:
+    window.updateMousePosition(event)
     window.handleButtonPress(MouseButton5)
   else:
     discard
@@ -770,13 +982,18 @@ proc otherMouseUp(self: ID, cmd: SEL, event: NSEvent): ID {.cdecl.} =
 
   case event.buttonNumber:
   of 2:
+    window.updateMousePosition(event)
     window.handleButtonRelease(MouseMiddle)
   of 3:
+    window.updateMousePosition(event)
     window.handleButtonRelease(MouseButton4)
   of 4:
+    window.updateMousePosition(event)
     window.handleButtonRelease(MouseButton5)
   else:
     discard
+
+include accessibility
 
 proc hasMarkedText(self: ID, cmd: SEL): bool {.cdecl.} =
   let window = windows.forNSWindow(self.NSView.window)
@@ -794,7 +1011,11 @@ proc markedRange(self: ID, cmd: SEL): NSRange {.cdecl.} =
 
 proc selectedRange(self: ID, cmd: SEL): NSRange {.cdecl.} =
   let window = windows.forNSWindow(self.NSView.window)
-  if window != nil:
+  if window != nil and window.markedText.int != 0:
+    NSMakeRange(window.state.imeCursorIndex.uint, 0)
+  elif window.hasTextInput:
+    window.selectedTextRange
+  elif window != nil:
     NSMakeRange(window.state.imeCursorIndex.uint, 0)
   else:
     kEmptyRange
@@ -848,6 +1069,7 @@ proc insertText2(
   obj: ID,
   replacementRange: NSRange
 ): ID {.cdecl.} =
+  ## Delivers committed AppKit text as one insertion, including newlines.
   let window = windows.forNSWindow(self.NSView.window)
   if window == nil:
     return
@@ -858,23 +1080,16 @@ proc insertText2(
   else:
     characters = obj.NSString
 
-  var range = NSMakeRange(0, characters.length.uint)
-  while range.length > 0:
-    var
-      codepoint: uint32
-      usedLength: uint
-    discard characters.getBytes(
-      codepoint.addr,
-      sizeof(codepoint).uint,
-      usedLength.addr,
-      NSUTF32StringEncoding,
-      0.NSStringEncodingConversionOptions,
-      range,
-      range.addr
-    )
-    if codepoint >= 0xf700 and codepoint <= 0xf7ff:
+  var text: string
+  for rune in ($characters).runes:
+    if rune.int >= 0xf700 and rune.int <= 0xf7ff:
       continue
-    window.handleRune(Rune(codepoint))
+    text.add($rune)
+  if replacementRange.location != NSNotFound.uint and
+    window.hasTextInput and window.onTextEdit != nil:
+      window.replaceNativeText(text, replacementRange)
+  else:
+    window.handleTextInput(text)
 
   if window.markedText.int != 0:
     window.markedText.ID.release()
@@ -885,6 +1100,21 @@ proc insertText2(
     window.state.imeCursorIndex = 0
     if window.onImeChange != nil:
       window.onImeChange()
+
+proc insertTextLegacy(self: ID, cmd: SEL, obj: ID): ID {.cdecl.} =
+  ## Accepts the legacy NSResponder insertion selector used by text services.
+  insertText2(self, cmd, obj, kEmptyRange)
+
+proc pasteText(self: ID, cmd: SEL, sender: ID): ID {.cdecl.} =
+  ## Captures the current pasteboard immediately for native paste actions.
+  let window = windows.forNSWindow(self.NSView.window)
+  if window == nil or not window.state.runeInputEnabled:
+    return
+  let value = NSPasteboard.generalPasteboard().stringForType(
+    NSPasteboardTypeString
+  )
+  if value.int != 0:
+    window.handleTextInput($value)
 
 proc characterIndexForPoint(
   self: ID,
@@ -987,18 +1217,21 @@ proc init() {.raises: [].} =
     addClass "WindyAppDelegate", "NSObject", WindyAppDelegate:
       addMethod "applicationWillFinishLaunching:", applicationWillFinishLaunching
       addMethod "applicationDidFinishLaunching:", applicationDidFinishLaunching
+      addMethod "applicationDidBecomeActive:", applicationActivityChanged
+      addMethod "applicationDidResignActive:", applicationActivityChanged
+      addMethod "applicationDidChangeScreenParameters:", applicationActivityChanged
 
     addClass "WindyWindow", "NSWindow", WindyWindow:
       addMethod "windowDidResize:", windowDidResize
       addMethod "windowDidMove:", windowDidMove
       addMethod "windowDidMiniaturize:", windowDidMiniaturize
       addMethod "windowDidDeminiaturize:", windowDidDeminiaturize
-      addMethod "windowDidEnterFullScreen:", windowDidEnterFullScreen
-      addMethod "windowDidExitFullScreen:", windowDidExitFullScreen
+      addMethod "toggleFullScreen:", toggleWindyFullscreen
       # The NSWindow key-eligibility check is the zero-argument getter
       # `canBecomeKeyWindow`; registering it with a trailing colon never
       # overrides it, which leaves borderless windows unable to become key.
       addMethod "canBecomeKeyWindow", canBecomeKeyWindow
+      addMethod "canBecomeMainWindow", canBecomeMainWindow
       addMethod "windowDidBecomeKey:", windowDidBecomeKey
       addMethod "windowDidResignKey:", windowDidResignKey
       addMethod "windowShouldClose:", windowShouldClose
@@ -1006,6 +1239,7 @@ proc init() {.raises: [].} =
     when defined(useMetal4) or defined(useCpu):
       addClass "WindyView", "NSView", WindyView:
         addProtocol "NSTextInputClient"
+        registerAccessibilityMethods(WindyView)
         addMethod "acceptsFirstResponder", acceptsFirstResponder
         addMethod "canBecomeKeyView", canBecomeKeyView
         addMethod "acceptsFirstMouse:", acceptsFirstMouse
@@ -1025,6 +1259,7 @@ proc init() {.raises: [].} =
         addMethod "otherMouseDown:", otherMouseDown
         addMethod "otherMouseUp:", otherMouseUp
         addMethod "draggingEntered:", draggingEntered
+        addMethod "draggingUpdated:", draggingEntered
         addMethod "performDragOperation:", performDragOperation
         addMethod "hasMarkedText", hasMarkedText
         addMethod "markedRange", markedRange
@@ -1034,6 +1269,8 @@ proc init() {.raises: [].} =
         addMethod "validAttributesForMarkedText", validAttributesForMarkedText
         addMethod "attributedSubstringForProposedRange:actualRange:", attributedSubstringForProposedRange
         addMethod "insertText:replacementRange:", insertText2
+        addMethod "insertText:", insertTextLegacy
+        addMethod "paste:", pasteText
         addMethod "characterIndexForPoint:", characterIndexForPoint
         addMethod "firstRectForCharacterRange:actualRange:", firstRectForCharacterRange
         addMethod "doCommandBySelector:", doCommandBySelector
@@ -1043,6 +1280,7 @@ proc init() {.raises: [].} =
     else:
       addClass "WindyView", "NSOpenGLView", WindyView:
         addProtocol "NSTextInputClient"
+        registerAccessibilityMethods(WindyView)
         addMethod "acceptsFirstResponder", acceptsFirstResponder
         addMethod "canBecomeKeyView", canBecomeKeyView
         addMethod "acceptsFirstMouse:", acceptsFirstMouse
@@ -1062,6 +1300,7 @@ proc init() {.raises: [].} =
         addMethod "otherMouseDown:", otherMouseDown
         addMethod "otherMouseUp:", otherMouseUp
         addMethod "draggingEntered:", draggingEntered
+        addMethod "draggingUpdated:", draggingEntered
         addMethod "performDragOperation:", performDragOperation
         addMethod "hasMarkedText", hasMarkedText
         addMethod "markedRange", markedRange
@@ -1071,6 +1310,8 @@ proc init() {.raises: [].} =
         addMethod "validAttributesForMarkedText", validAttributesForMarkedText
         addMethod "attributedSubstringForProposedRange:actualRange:", attributedSubstringForProposedRange
         addMethod "insertText:replacementRange:", insertText2
+        addMethod "insertText:", insertTextLegacy
+        addMethod "paste:", pasteText
         addMethod "characterIndexForPoint:", characterIndexForPoint
         addMethod "firstRectForCharacterRange:actualRange:", firstRectForCharacterRange
         addMethod "doCommandBySelector:", doCommandBySelector
@@ -1103,19 +1344,25 @@ proc init() {.raises: [].} =
   initialized = true
 
 proc processKeyDown(event: NSEvent) =
+  ## Synchronizes modifiers before delivering physical or synthetic keys.
   let nsWindow = event.window()
   let window = windows.forNSWindow(nsWindow)
   if window == nil:
     return
 
+  let flags = event.modifierFlags()
+  window.syncModifierState(flags)
   window.handleButtonPress(keyCodeToButton[event.keyCode.int])
-  if window.state.runeInputEnabled:
-    discard nsWindow.contentView().inputContext.handleEvent(event)
+  if window.state.runeInputEnabled and
+    (flags and ModifierClassCommand) == 0:
+      discard nsWindow.contentView().inputContext.handleEvent(event)
 
 proc processKeyUp(event: NSEvent) =
+  ## Refreshes modifiers even when a synthetic sender omits flagsChanged.
   let window = windows.forNSWindow(event.window())
   if window == nil:
     return
+  window.syncModifierState(event.modifierFlags())
   window.handleButtonRelease(keyCodeToButton[event.keyCode.int])
 
 proc processFlagsChanged(event: NSEvent) =
@@ -1142,16 +1389,22 @@ proc processFlagsChanged(event: NSEvent) =
     else:
       window.handleButtonPress(button)
 
-proc drainEvents() =
-  ## Dequeues and dispatches all pending AppKit events.
+proc drainEvents(timeoutMs: int) =
+  ## Waits for the first AppKit event, then dispatches the pending batch.
   autoreleasepool:
+    var deadline =
+      if timeoutMs > 0:
+        NSDate.dateWithTimeIntervalSinceNow(timeoutMs.float64 / 1000)
+      else:
+        NSDate.distantPast
     while true:
       let event = NSApp.nextEventMatchingMask(
         NSEventMaskAny,
-        NSDate.distantPast,
+        deadline,
         NSDefaultRunLoopMode,
         true
       )
+      deadline = NSDate.distantPast
       if event.int == 0:
         break
 
@@ -1198,7 +1451,9 @@ proc rescueActivation() =
   NSApp.activateIgnoringOtherApps(true)
   runLoopTurn()
 
-proc pollEvents*() =
+proc waitEvents*(timeoutMs: int) =
+  ## Runs onFrame callbacks, then waits up to timeoutMs and dispatches events.
+  ## Gate drawing inside onFrame for on-demand UIs; zero polls without waiting.
   autoreleasepool:
     rescueActivation()
 
@@ -1213,9 +1468,40 @@ proc pollEvents*() =
   for window in windows:
     window.state.perFrame = PerFrame()
 
-  drainEvents()
+  var timeout = httpWaitTimeout(timeoutMs)
+  if activationRescueDeadline > 0:
+    timeout = min(timeout, 10)
+  drainEvents(timeout)
+
+  autoreleasepool:
+    updateFullscreenWindows()
+    let inputWindows = windows
+    for window in inputWindows:
+      window.updateMouseConfinement()
 
   pollHttp()
+
+proc wakeEvents*() {.raises: [], gcsafe.} =
+  ## Wakes native waiting from any thread after the first window is created.
+  if NSApp.int == 0:
+    return
+  autoreleasepool:
+    let event = NSEvent.otherEventWithType(
+      NSEventTypeApplicationDefined.int,
+      NSMakePoint(0, 0),
+      0,
+      0,
+      0,
+      NSObject(0),
+      0,
+      0,
+      0
+    )
+    NSApp.postEvent(event, false)
+
+proc pollEvents*() =
+  ## Draws pending frames and dispatches events without waiting.
+  waitEvents(0)
 
 proc centerWindow(window: Window) =
   ## Centers the native window frame using screen point coordinates.
@@ -1271,7 +1557,15 @@ proc presentPixels*(window: Window, image: Image) =
     discard
 
 proc close*(window: Window) =
+  if window.state.closed or window.closing:
+    return
+  window.closing = true
+  window.state.closeRequested = true
+  defer: window.closing = false
+  window.releaseMouseConfinement()
   window.releaseMouse()
+  window.fullscreenState = false
+  updateFullscreenPresentation()
   window.cpuImage.ID.release()
   window.cpuImage = 0.NSImage
   window.onCloseRequest = nil
@@ -1284,8 +1578,12 @@ proc close*(window: Window) =
   window.onButtonPress = nil
   window.onButtonRelease = nil
   window.onRune = nil
+  window.onTextInput = nil
+  window.onTextEdit = nil
+  window.textInput = TextInputState()
   window.onImeChange = nil
   window.onFileDrop = nil
+  window.onFileDropPaths = nil
 
   if window.inner.int != 0:
     autoreleasepool:
@@ -1348,6 +1646,9 @@ proc newWindow*(
       discard result.inner.makeFirstResponder(nativeView)
       nativeView.registerForDraggedTypes(
         NSArray.arrayWithObject(NSFilenamesPboardType.ID)
+          .arrayByAddingObject(NSPasteboardTypeFileURL.ID)
+          .arrayByAddingObject(NSPasteboardTypePNG.ID)
+          .arrayByAddingObject(NSPasteboardTypeTIFF.ID)
       )
     else:
       let
@@ -1396,13 +1697,24 @@ proc newWindow*(
 
       result.inner.setDelegate(result.inner.ID)
       result.inner.setContentView(openglView.NSView)
+      # Attach the drawable even if the view is never shown.
+      openglView.openGLContext.setView(openglView.NSView)
       discard result.inner.makeFirstResponder(openglView.NSView)
       openglView.NSView.registerForDraggedTypes(
         NSArray.arrayWithObject(NSFilenamesPboardType.ID)
+          .arrayByAddingObject(NSPasteboardTypeFileURL.ID)
+          .arrayByAddingObject(NSPasteboardTypePNG.ID)
+          .arrayByAddingObject(NSPasteboardTypeTIFF.ID)
       )
 
     result.inner.setRestorable(false)
+    result.inner.setCollectionBehavior(
+      (result.inner.collectionBehavior and not (
+        FullScreenPrimary or FullScreenAuxiliary
+      )) or FullScreenNone
+    )
 
+    result.updateBackingScale(result.contentScale)
     windows.add(result)
 
     result.title = title
@@ -1415,8 +1727,6 @@ proc newWindow*(
     result.visible = visible
 
     result.minimizedState = result.inner.isMiniaturized
-    result.fullscreenState =
-      (result.inner.styleMask and NSWindowStyleMaskFullScreen) != 0
 
 proc title*(window: Window): string =
   window.state.title
@@ -1494,13 +1804,10 @@ proc getClipboardContentKinds*(): set[ClipboardContentKind] =
         types.containsObject(NSPasteboardTypeTIFF.ID):
       result.incl ImageContent
 
-proc getClipboardImage*(): Image =
-  ## Reads a PNG or TIFF image from the system pasteboard.
-  init()
+proc readPasteboardImage(pboard: NSPasteboard): Image =
+  ## Decodes a PNG or TIFF supplied by clipboard or native image dragging.
   autoreleasepool:
-    let
-      pboard = NSPasteboard.generalPasteboard()
-      types = pboard.types
+    let types = pboard.types
 
     if types.int == 0:
       return
@@ -1510,7 +1817,7 @@ proc getClipboardImage*(): Image =
       if data.int != 0:
         try:
           return decodePng(data.bytes, data.length.int).convertToImage()
-        except:
+        except PixieError:
           discard
 
     if not types.containsObject(NSPasteboardTypeTIFF.ID):
@@ -1535,8 +1842,13 @@ proc getClipboardImage*(): Image =
 
     try:
       result = decodePng(pngData.bytes, pngData.length.int).convertToImage()
-    except:
+    except PixieError:
       return
+
+proc getClipboardImage*(): Image =
+  ## Reads a PNG or TIFF image from the system pasteboard.
+  init()
+  readPasteboardImage(NSPasteboard.generalPasteboard())
 
 proc getClipboardString*(): string =
   ## Gets the clipboard content as a string.
@@ -1557,6 +1869,26 @@ proc getClipboardString*(): string =
       return
 
     result = $value
+
+proc setClipboardImage*(image: Image) {.raises: [WindyError].} =
+  ## Copies lossless image pixels to the native pasteboard as PNG.
+  if image == nil or image.width <= 0 or image.height <= 0:
+    raise newException(WindyError, "Cannot copy an empty clipboard image")
+  var encoded: string
+  try:
+    encoded = image.encodePng()
+  except PixieError as error:
+    raise newException(WindyError, "Could not encode clipboard image: " &
+      error.msg)
+  init()
+  autoreleasepool:
+    let
+      pboard = NSPasteboard.generalPasteboard()
+      data = NSData.dataWithBytes(encoded[0].addr, encoded.len)
+    pboard.clearContents()
+    if not pboard.setData(data, NSPasteboardTypePNG):
+      raise newException(WindyError, "Could not write clipboard image")
+
 
 proc setClipboardString*(value: string) =
   ## Sets the clipboard content to the given string.
@@ -1748,3 +2080,6 @@ proc saveFileDialog*(
       let url = panel.URL()
       if url.int != 0:
         result = $url.path()
+
+proc touches*(window: Window): seq[TouchContact] =
+  @[]

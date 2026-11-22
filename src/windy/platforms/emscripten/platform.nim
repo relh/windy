@@ -5,7 +5,15 @@ import
 # include for EMSCRIPTEN_KEEPALIVE
 {.emit: """
 #include <emscripten.h>
+EM_JS(double, windy_canvas_left, (), {
+  return Module.canvas.getBoundingClientRect().left;
+});
+EM_JS(double, windy_canvas_top, (), {
+  return Module.canvas.getBoundingClientRect().top;
+});
 """.}
+proc windy_canvas_left(): cdouble {.importc, nodecl.}
+proc windy_canvas_top(): cdouble {.importc, nodecl.}
 
 import emdefs
 
@@ -13,6 +21,7 @@ type
   Window* = ref object
     onCloseRequest*: Callback
     onFrame*: Callback
+    onTouch*: TouchCallback
     onMove*: Callback
     onResize*: Callback
     onFocusChange*: Callback
@@ -21,8 +30,11 @@ type
     onButtonPress*: ButtonCallback
     onButtonRelease*: ButtonCallback
     onRune*: RuneCallback
+    onTextInput*: TextInputCallback
+    onTextEdit*: TextInputEditCallback
     onImeChange*: Callback
     onFileDrop*: FileDropCallback
+    onFileDropPaths*: FileDropPathsCallback
 
     ## In Emscripten, the canvas is the more or less the window.
     canvas: cstring
@@ -153,6 +165,15 @@ proc pollEvents*() =
   drainDeferredWindowEvents()
   pollHttp()
   emscripten_sleep(0)
+
+proc waitEvents*(timeoutMs: int) =
+  ## Yields to browser-managed events and animation frames without blocking.
+  ## The browser controls scheduling, so timeoutMs has no effect here.
+  pollEvents()
+
+proc wakeEvents*() {.raises: [], gcsafe.} =
+  ## Browser callbacks already wake their event loop.
+  discard
 
 proc size*(window: Window): IVec2 =
   # Get the size of the canvas in physical pixels (CSS size × DPR).
@@ -503,11 +524,10 @@ proc stencilBits*(window: Window): int =
   8
 
 proc setClipboardString*(s: string) =
-  # TODO: Implement clipboard with Emscripten.
-  raise newException(
-    Exception,
-    "setClipboardString is not supported on emscripten"
-  )
+  ## Requests an asynchronous write to the system clipboard.
+  ## Use a secure context and call from a user input callback for browser
+  ## compatibility. Failed writes are reported in the browser console.
+  write_clipboard_text(s.cstring)
 
 proc getClipboardString*(): string =
   ## Returns the text supplied by the latest browser paste event.
@@ -520,6 +540,14 @@ proc getClipboardContentKinds*(): set[ClipboardContentKind] =
 proc getClipboardImage*(): Image =
   ## Image clipboard is not implemented on Emscripten yet.
   nil
+
+proc setClipboardImage*(image: Image) {.raises: [WindyError].} =
+  ## Reports unsupported synchronous image clipboard writes in browsers.
+  raise newException(
+    WindyError,
+    "Image clipboard writes are not supported on Emscripten"
+  )
+
 
 proc closeIme*(window: Window) =
   if window.state.imeCompositionString.len > 0:
@@ -734,10 +762,24 @@ proc mouseButtonToButton(button: cushort): Button =
   else: MouseButton4
 
 # Event handlers
+proc updateMousePosition(window: Window, mouseEvent: ptr EmscriptenMouseEvent) =
+  ## Use canvas-relative coordinates for both canvas and document events.
+  let position = ivec2(
+    int32(mouseEvent.clientX.float64 - windy_canvas_left()),
+    int32(mouseEvent.clientY.float64 - windy_canvas_top())
+  )
+  window.state.mousePrevPos = window.state.mousePos
+  if window.state.hasPrevMouse:
+    window.state.perFrame.mouseDelta += position - window.state.mousePos
+  window.state.mousePos = position
+  window.state.hasPrevMouse = true
+
 proc onMouseDown(eventType: cint, mouseEvent: ptr EmscriptenMouseEvent, userData: pointer): EM_BOOL {.cdecl.} =
   let window = cast[Window](userData)
   # Ensure canvas has focus when clicked
   make_canvas_focusable()
+  window.updateMousePosition(mouseEvent)
+  window.state.mouseInside = true
   let button = mouseButtonToButton(mouseEvent.button)
   window.handleButtonPress(button)
   return 1
@@ -745,16 +787,18 @@ proc onMouseDown(eventType: cint, mouseEvent: ptr EmscriptenMouseEvent, userData
 proc onMouseUp(eventType: cint, mouseEvent: ptr EmscriptenMouseEvent, userData: pointer): EM_BOOL {.cdecl.} =
   let window = cast[Window](userData)
   let button = mouseButtonToButton(mouseEvent.button)
+  if button notin window.state.buttonDown:
+    return 0
+  window.updateMousePosition(mouseEvent)
   window.handleButtonRelease(button)
   return 1
 
 proc onMouseMove(eventType: cint, mouseEvent: ptr EmscriptenMouseEvent, userData: pointer): EM_BOOL {.cdecl.} =
   let window = cast[Window](userData)
-  window.state.mousePrevPos = window.state.mousePos
-  # Use clientX/clientY as they are more reliably populated
-  window.state.mousePos = ivec2(mouseEvent.clientX.int32, mouseEvent.clientY.int32)
-  window.state.mouseInside = true
-  window.state.perFrame.mouseDelta += window.state.mousePos - window.state.mousePrevPos
+  if not window.state.mouseInside and
+      window.state.buttonDown * {MouseLeft, MouseMiddle, MouseRight, MouseButton4} == {}:
+    return 0
+  window.updateMousePosition(mouseEvent)
   if window.onMouseMove != nil:
     window.onMouseMove()
   return 1
@@ -762,6 +806,8 @@ proc onMouseMove(eventType: cint, mouseEvent: ptr EmscriptenMouseEvent, userData
 proc onMouseEnter(eventType: cint, mouseEvent: ptr EmscriptenMouseEvent, userData: pointer): EM_BOOL {.cdecl.} =
   let window = cast[Window](userData)
   window.state.mouseInside = true
+  window.state.hasPrevMouse = false
+  window.updateMousePosition(mouseEvent)
   return 1
 
 proc onMouseLeave(eventType: cint, mouseEvent: ptr EmscriptenMouseEvent, userData: pointer): EM_BOOL {.cdecl.} =
@@ -848,6 +894,8 @@ proc onBlur(eventType: cint, focusEvent: ptr EmscriptenFocusEvent, userData: poi
   ## Releases held input before notifying the application of focus loss.
   let window = cast[Window](userData)
   clearButtonsTemplate()
+  window.state.hasPrevMouse = false
+  window.state.perFrame.mouseDelta = ivec2(0)
   if frameDispatchActive:
     pendingFocusChange = true
     return 1
@@ -883,8 +931,8 @@ proc drainDeferredWindowEvents() =
 proc setupEventHandlers(window: Window) =
   # Mouse events
   discard emscripten_set_mousedown_callback_on_thread(window.canvas, cast[pointer](window), 1, onMouseDown, EM_CALLBACK_THREAD_CONTEXT)
-  discard emscripten_set_mouseup_callback_on_thread(window.canvas, cast[pointer](window), 1, onMouseUp, EM_CALLBACK_THREAD_CONTEXT)
-  discard emscripten_set_mousemove_callback_on_thread(window.canvas, cast[pointer](window), 1, onMouseMove, EM_CALLBACK_THREAD_CONTEXT)
+  discard emscripten_set_mouseup_callback_on_thread(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, cast[pointer](window), 1, onMouseUp, EM_CALLBACK_THREAD_CONTEXT)
+  discard emscripten_set_mousemove_callback_on_thread(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, cast[pointer](window), 1, onMouseMove, EM_CALLBACK_THREAD_CONTEXT)
   discard emscripten_set_mouseenter_callback_on_thread(window.canvas, cast[pointer](window), 1, onMouseEnter, EM_CALLBACK_THREAD_CONTEXT)
   discard emscripten_set_mouseleave_callback_on_thread(window.canvas, cast[pointer](window), 1, onMouseLeave, EM_CALLBACK_THREAD_CONTEXT)
 
@@ -1281,3 +1329,6 @@ proc saveFileDialog*(
   discard defaultName
   warn("saveFileDialog is not supported on emscripten")
   result = ""
+
+proc touches*(window: Window): seq[TouchContact] =
+  @[]
